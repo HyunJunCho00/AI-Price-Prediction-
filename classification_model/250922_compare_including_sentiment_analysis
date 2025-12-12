@@ -1,0 +1,295 @@
+import os
+import numpy as np
+import pandas as pd
+import pandas_ta as ta
+import yfinance as yf
+from collections import Counter
+from sklearn.linear_model import LogisticRegression
+from sklearn.neural_network import MLPClassifier
+from sklearn.svm import SVC
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import accuracy_score
+from sklearn.neighbors import NearestNeighbors
+from sklearn.model_selection import GridSearchCV
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Input, LSTM, Dense, Dropout
+from tensorflow.keras.optimizers import Adam
+from xgboost import XGBClassifier
+from lightgbm import LGBMClassifier
+
+START_DATE = "2020-01-01"
+END_DATE = "2025-09-19"
+TRAIN_END = "2024-12-31"
+SENTIMENT_CSV = "daily_sentiment.csv"
+TICKER = "ETH-USD"
+LSTM_LOOKBACK = 7
+
+gpus = tf.config.list_physical_devices('GPU')
+if gpus:
+    try:
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+    except Exception:
+        pass
+
+def load_sentiment(csv_path):
+    df = pd.read_csv(csv_path)
+    df['date'] = pd.to_datetime(df['date']).dt.normalize()
+    df = df[df['date'] >= pd.to_datetime(START_DATE)].copy()
+    sentiment_col = next((col for col in ['mean_sentiment', 'sentiment', 'label'] if col in df.columns), None)
+    df['sentiment'] = pd.to_numeric(df[sentiment_col], errors='coerce').fillna(0.0) if sentiment_col else 0.0
+    df = df[['date','sentiment']].drop_duplicates(subset=['date']).set_index('date')
+    return df
+
+def fetch_price(start_date, end_date, ticker=TICKER):
+    df = yf.download(ticker, start=start_date, end=(pd.to_datetime(end_date)+pd.Timedelta(days=1)).strftime("%Y-%m-%d"), progress=False, auto_adjust=False)
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns=df.columns.get_level_values(0)
+    df = df.reset_index()
+    df = df.rename(columns={'Date':'date', 'Open': 'open', 'High':'high', 'Low':'low', 'Close':'close', 'Volume':'volume'})
+    df['date'] = pd.to_datetime(df['date']).dt.normalize()
+    df = df[['date', 'open', 'high', 'low', 'close', 'volume']]
+    df = df[df['date'] >= pd.to_datetime(START_DATE)].reset_index(drop=True)
+    return df
+
+def prepare_data(price_df, sentiment_df):
+    df = price_df.copy().set_index('date').sort_index()
+    
+    df.ta.rsi(close='close', length=14, append=True)
+    df.ta.macd(close='close', fast=12, slow=26, signal=9, append=True)
+    df.ta.bbands(close='close', length=20, append=True)
+    df.ta.obv(close='close', volume=df['volume'], append=True)
+    
+    df['return'] = df['close'].pct_change()
+    df['target'] = (df['return'] > 0).astype(int)
+    df['volatility_14d'] = df['return'].rolling(window=14).std()
+    
+    s = sentiment_df.copy()
+    s['sentiment_ma_3'] = s['sentiment'].rolling(window=3).mean()
+    s['sentiment_ma_7'] = s['sentiment'].rolling(window=7).mean()
+    
+    merged = df.merge(s, how='left', left_index=True, right_index=True)
+    merged['sentiment'] = merged['sentiment'].fillna(0.0)
+    merged['sentiment_ma_3'] = merged['sentiment_ma_3'].fillna(0.0)
+    merged['sentiment_ma_7'] = merged['sentiment_ma_7'].fillna(0.0)
+
+    merged['sentiment_x_volatility'] = merged['sentiment'] * merged['volatility_14d']
+    
+    feature_columns_to_shift = [col for col in merged.columns if col != 'target']
+    merged[feature_columns_to_shift] = merged[feature_columns_to_shift].shift(1)
+        
+    merged = merged.dropna().reset_index().rename(columns={'index':'date'})
+    
+    price_only_cols = [col for col in merged.columns if any(indicator in col for indicator in ['RSI', 'MACD', 'BB', 'OBV', 'volatility']) and 'sentiment' not in col]
+    feature_cols = price_only_cols + [col for col in merged.columns if col.startswith('sentiment')]
+
+    return merged, feature_cols, price_only_cols
+
+def create_lstm_dataset(X, y, lookback=LSTM_LOOKBACK):
+    X_seq, y_seq = [], []
+    for i in range(len(X) - lookback):
+        X_seq.append(X[i:i+lookback])
+        y_seq.append(y[i+lookback])
+    return np.array(X_seq), np.array(y_seq)
+
+def train_classifiers_basic(X_train, y_train):
+    logit = LogisticRegression(max_iter=500, solver='liblinear', random_state=42).fit(X_train, y_train)
+    mlp = MLPClassifier(hidden_layer_sizes=(100, 50), max_iter=1000, early_stopping=True, random_state=42, n_iter_no_change=20).fit(X_train, y_train)
+    svc = SVC(kernel='rbf', C=1.0, probability=True, random_state=42).fit(X_train, y_train)
+    lgbm = LGBMClassifier(random_state=42, device='gpu').fit(X_train, y_train)
+    return {'logit':logit, 'mlp':mlp, 'svc':svc, 'lgbm':lgbm}
+
+def train_lstm_classifier(X_train_seq, y_train_seq, units=64, epochs=30, batch_size=32):
+    model = Sequential([
+        Input(shape=(X_train_seq.shape[1], X_train_seq.shape[2])),
+        LSTM(units, activation='tanh', return_sequences=True),
+        Dropout(0.3),
+        LSTM(units // 2, activation='tanh'),
+        Dropout(0.3),
+        Dense(units // 4, activation='relu'),
+        Dense(1, activation='sigmoid')
+    ])
+    model.compile(optimizer=Adam(learning_rate=0.001), loss='binary_crossentropy', metrics=['accuracy'])
+    early_stopping = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
+    model.fit(X_train_seq, y_train_seq, epochs=epochs, batch_size=batch_size, verbose=0, validation_split=0.15, callbacks=[early_stopping])
+    return model
+
+def predict_lstm_classifier(model, X_seq):
+    p = model.predict(X_seq, verbose=0).flatten()
+    return (p >= 0.5).astype(int)
+
+def build_casebase(pred_matrix, y_train):
+    return {'preds': np.array(pred_matrix), 'y': np.array(y_train)}
+
+def cbr_classify(casebase, query_vec, k):
+    n_neighbors = min(k, len(casebase['preds']))
+    if n_neighbors == 0: return 0
+    nbrs = NearestNeighbors(n_neighbors=n_neighbors, metric='euclidean').fit(casebase['preds'])
+    _, idx = nbrs.kneighbors([query_vec])
+    neigh = casebase['y'][idx.flatten()]
+    return Counter(neigh).most_common(1)[0][0]
+
+def mde(y_true, y_pred):
+    return 1.0 - accuracy_score(y_true, y_pred)
+
+def evaluate_models(train_df, test_df, feature_cols, price_only_cols, best_xgb_model):
+    if len(test_df) < LSTM_LOOKBACK:
+        return {'error':'not enough test data'}
+
+    y_clf_train = train_df['target'].values
+    y_clf_test = test_df['target'].values
+    
+    scaler_p = StandardScaler().fit(train_df[price_only_cols])
+    Xp_train_scaled = scaler_p.transform(train_df[price_only_cols])
+    Xp_test_scaled = scaler_p.transform(test_df[price_only_cols])
+
+    scaler_n = StandardScaler().fit(train_df[feature_cols])
+    Xn_train_scaled = scaler_n.transform(train_df[feature_cols])
+    Xn_test_scaled = scaler_n.transform(test_df[feature_cols])
+
+    price_models = train_classifiers_basic(Xp_train_scaled, y_clf_train)
+    news_models = train_classifiers_basic(Xn_train_scaled, y_clf_train)
+    news_models['xgb'] = best_xgb_model
+    
+    xgb_price_only = XGBClassifier(use_label_encoder=False, eval_metric='logloss', random_state=42, tree_method='hist', device='cuda')
+    xgb_price_only.fit(Xp_train_scaled, y_clf_train)
+    price_models['xgb'] = xgb_price_only
+
+    Xp_train_seq, yp_train_seq = create_lstm_dataset(Xp_train_scaled, y_clf_train)
+    Xp_test_seq, yp_test_seq = create_lstm_dataset(Xp_test_scaled, y_clf_test)
+    Xn_train_seq, yn_train_seq = create_lstm_dataset(Xn_train_scaled, y_clf_train)
+    Xn_test_seq, yn_test_seq = create_lstm_dataset(Xn_test_scaled, y_clf_test)
+
+    lstm_price = train_lstm_classifier(Xp_train_seq, yp_train_seq)
+    p_lstm_test = predict_lstm_classifier(lstm_price, Xp_test_seq)
+    lstm_news = train_lstm_classifier(Xn_train_seq, yn_train_seq)
+    n_lstm_test = predict_lstm_classifier(lstm_news, Xn_test_seq)
+    
+    p_logit_test = price_models['logit'].predict(Xp_test_scaled)
+    p_mlp_test = price_models['mlp'].predict(Xp_test_scaled)
+    p_svc_test = price_models['svc'].predict(Xp_test_scaled)
+    p_lgbm_test = price_models['lgbm'].predict(Xp_test_scaled)
+    p_xgb_test = price_models['xgb'].predict(Xp_test_scaled)
+    
+    n_logit_test = news_models['logit'].predict(Xn_test_scaled)
+    n_mlp_test = news_models['mlp'].predict(Xn_test_scaled)
+    n_svc_test = news_models['svc'].predict(Xn_test_scaled)
+    n_lgbm_test = news_models['lgbm'].predict(Xn_test_scaled)
+    n_xgb_test = news_models['xgb'].predict(Xn_test_scaled)
+    
+    results = {}
+    results['price_test_acc'] = {
+        'P_Logit': accuracy_score(y_clf_test, p_logit_test), 'P_ANN': accuracy_score(y_clf_test, p_mlp_test),
+        'P_SVM': accuracy_score(y_clf_test, p_svc_test), 'P_LGBM': accuracy_score(y_clf_test, p_lgbm_test),
+        'P_XGB': accuracy_score(y_clf_test, p_xgb_test), 'P_LSTM': accuracy_score(yp_test_seq, p_lstm_test)
+    }
+    results['news_test_acc'] = {
+        'N_Logit': accuracy_score(y_clf_test, n_logit_test), 'N_ANN': accuracy_score(y_clf_test, n_mlp_test),
+        'N_SVM': accuracy_score(y_clf_test, n_svc_test), 'N_LGBM': accuracy_score(y_clf_test, n_lgbm_test),
+        'N_XGB': accuracy_score(y_clf_test, n_xgb_test), 'N_LSTM': accuracy_score(yn_test_seq, n_lstm_test)
+    }
+    
+    p_train_preds = np.column_stack([m.predict(Xp_train_scaled) for m in price_models.values()])
+    n_train_preds = np.column_stack([m.predict(Xn_train_scaled) for m in news_models.values()])
+    p_lstm_train = predict_lstm_classifier(lstm_price, Xp_train_seq)
+    n_lstm_train = predict_lstm_classifier(lstm_news, Xn_train_seq)
+    
+    p_train_preds_cbr = np.column_stack([p_train_preds[LSTM_LOOKBACK:], p_lstm_train])
+    n_train_preds_cbr = np.column_stack([n_train_preds[LSTM_LOOKBACK:], n_lstm_train])
+
+    p_test_preds_cbr = np.column_stack([p_logit_test[LSTM_LOOKBACK:], p_mlp_test[LSTM_LOOKBACK:], p_svc_test[LSTM_LOOKBACK:], p_lgbm_test[LSTM_LOOKBACK:], p_xgb_test[LSTM_LOOKBACK:], p_lstm_test])
+    n_test_preds_cbr = np.column_stack([n_logit_test[LSTM_LOOKBACK:], n_mlp_test[LSTM_LOOKBACK:], n_svc_test[LSTM_LOOKBACK:], n_lgbm_test[LSTM_LOOKBACK:], n_xgb_test[LSTM_LOOKBACK:], n_lstm_test])
+    
+    p_case = build_casebase(p_train_preds_cbr, yp_train_seq)
+    n_case = build_casebase(n_train_preds_cbr, yn_train_seq)
+    
+    best_k_p, best_acc_p, best_preds_p = 1, 0.0, None
+    for k in range(1, 12, 2):
+        ypreds = [cbr_classify(p_case, p_test_preds_cbr[i], k) for i in range(len(p_test_preds_cbr))]
+        acc = accuracy_score(yp_test_seq, ypreds)
+        if acc > best_acc_p:
+            best_acc_p, best_k_p, best_preds_p = acc, k, ypreds
+    
+    best_k_n, best_acc_n, best_preds_n = 1, 0.0, None
+    for k in range(1, 12, 2):
+        ypreds = [cbr_classify(n_case, n_test_preds_cbr[i], k) for i in range(len(n_test_preds_cbr))]
+        acc = accuracy_score(yn_test_seq, ypreds)
+        if acc > best_acc_n:
+            best_acc_n, best_k_n, best_preds_n = acc, k, ypreds
+
+    results['price_cbr'] = {'k': best_k_p, 'accuracy': best_acc_p, 'MDE': mde(yp_test_seq, np.array(best_preds_p)) if best_preds_p is not None else None}
+    results['news_cbr'] = {'k': best_k_n, 'accuracy': best_acc_n, 'MDE': mde(yn_test_seq, np.array(best_preds_n)) if best_preds_n is not None else None}
+    
+    df_price = pd.DataFrame.from_dict(results['price_test_acc'], orient='index', columns=['Accuracy'])
+    df_price['MDE'] = 1 - df_price['Accuracy']
+    df_news = pd.DataFrame.from_dict(results['news_test_acc'], orient='index', columns=['Accuracy'])
+    df_news['MDE'] = 1 - df_news['Accuracy']
+
+    print("PRICE TEST (Selected Features)")
+    print(df_price.to_string())
+    print("\nNEWS TEST (Selected Features)")
+    print(df_news.to_string())
+    print(f"\nPRICE CBR k= {results['price_cbr']['k']}  accuracy= {results['price_cbr']['accuracy']:.6f}  MDE= {results['price_cbr']['MDE']:.6f}")
+    print(f"NEWS CBR k= {results['news_cbr']['k']}  accuracy= {results['news_cbr']['accuracy']:.6f}  MDE= {results['news_cbr']['MDE']:.6f}")
+    
+    return results
+
+def main():
+    sentiment_df = load_sentiment(SENTIMENT_CSV)
+    price_df = fetch_price(START_DATE, END_DATE)
+    data_df, all_feature_cols, all_price_cols = prepare_data(price_df, sentiment_df)
+
+    train_df = data_df[data_df['date'] <= pd.to_datetime(TRAIN_END)].copy()
+    test_df = data_df[data_df['date'] > pd.to_datetime(TRAIN_END)].copy()
+
+    X_train_all = train_df[all_feature_cols]
+    y_train = train_df['target']
+    
+    temp_xgb = XGBClassifier(use_label_encoder=False, eval_metric='logloss', random_state=42, tree_method='hist', device='cuda')
+    temp_xgb.fit(X_train_all, y_train)
+    
+    importances = pd.DataFrame({
+        'feature': all_feature_cols,
+        'importance': temp_xgb.feature_importances_
+    }).sort_values('importance', ascending=False)
+    
+    print("--- Feature Importances ---")
+    print(importances)
+    
+    selected_features_news = importances[importances['importance'] > 0.01]['feature'].tolist()
+    if not selected_features_news:
+        selected_features_news = importances.head(10)['feature'].tolist()
+        
+    selected_features_price = [f for f in selected_features_news if f in all_price_cols]
+    
+    print(f"\nSelected News Features ({len(selected_features_news)}): {selected_features_news}")
+    print(f"Selected Price Features ({len(selected_features_price)}): {selected_features_price}\n")
+    
+    param_grid = {
+        'n_estimators': [100, 200],
+        'max_depth': [3, 5, 7],
+        'learning_rate': [0.05, 0.1],
+        'subsample': [0.8, 1.0],
+        'colsample_bytree': [0.8, 1.0]
+    }
+    
+    xgb_grid = XGBClassifier(use_label_encoder=False, eval_metric='logloss', random_state=42, tree_method='hist', device='cuda')
+    grid_search = GridSearchCV(estimator=xgb_grid, param_grid=param_grid, cv=3, n_jobs=-1, verbose=1, scoring='accuracy')
+    
+    scaler_for_grid = StandardScaler().fit(train_df[selected_features_news])
+    X_train_scaled_for_grid = scaler_for_grid.transform(train_df[selected_features_news])
+    
+    print("--- Starting GridSearchCV for XGBoost ---")
+    grid_search.fit(X_train_scaled_for_grid, y_train)
+    print("--- GridSearchCV Finished ---")
+    
+    best_xgb = grid_search.best_estimator_
+    print(f"\nBest XGBoost Params: {grid_search.best_params_}")
+    print(f"Best XGBoost Accuracy on Train Set: {grid_search.best_score_:.4f}\n")
+
+    results = evaluate_models(train_df, test_df, selected_features_news, selected_features_price, best_xgb)
+    return results
+
+if __name__ == "__main__":
+    results = main()

@@ -1,0 +1,354 @@
+import os, glob, re
+import pandas as pd, numpy as np, yfinance as yf, warnings
+from sklearn.linear_model import LogisticRegression
+from sklearn.neural_network import MLPClassifier
+from sklearn.svm import SVC
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, confusion_matrix
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+from tensorflow.keras.optimizers import Adam
+warnings.filterwarnings('ignore')
+
+ROOT_DIR = "./news_data"    
+START_DATE = "2020-01-01"
+END_DATE = "2025-09-23"
+TRAIN_END = "2024-12-31"
+TICKER = "ETH-USD"
+SEQ_LEN = 3
+np.random.seed(42); tf.random.set_seed(42)
+
+def read_and_aggregate_news_label(folder):
+    """라벨 컬럼 기반 뉴스 집계"""
+    files = sorted(glob.glob(os.path.join(folder, "*.csv")))
+    rows = []
+
+    for f in files:
+        try:
+            df = pd.read_csv(f)
+        except:
+            continue
+        
+        if 'date' in df.columns:
+            df['date'] = pd.to_datetime(df['date']).dt.normalize()
+        else:
+            dt = parse_date_from_filename(f)
+            if dt is None:
+                continue
+            df['date'] = dt
+        
+        if 'label' in df.columns:
+            df['sentiment_class'] = df['label']  # 기존 label 그대로 사용
+        else:
+            continue
+
+        rows.append(df[['date', 'sentiment_class']])
+    
+    if not rows:
+        return pd.DataFrame(columns=['date', 'total_news', 'pos_ratio', 'neg_ratio', 'neu_ratio'])
+    
+    all_df = pd.concat(rows, ignore_index=True)
+    
+    # 일별 집계
+    daily_agg = all_df.groupby('date').agg(
+        total_news=('sentiment_class', 'count'),
+        pos_count=('sentiment_class', lambda x: (x == 1).sum()),
+        neg_count=('sentiment_class', lambda x: (x == -1).sum()),
+        neu_count=('sentiment_class', lambda x: (x == 0).sum())
+    ).reset_index()
+    
+    daily_agg['pos_ratio'] = daily_agg['pos_count'] / daily_agg['total_news']
+    daily_agg['neg_ratio'] = daily_agg['neg_count'] / daily_agg['total_news']
+    daily_agg['neu_ratio'] = daily_agg['neu_count'] / daily_agg['total_news']
+
+    daily_agg['avg_sentiment'] = all_df.groupby('date')['sentiment_class'].mean().values
+    
+    return daily_agg[['date', 'total_news', 'pos_ratio', 'neg_ratio', 'neu_ratio','avg_sentiment']]
+
+def fetch_price_data(start_date, end_date, ticker=TICKER):
+    df = yf.download(ticker, start=start_date, end=(pd.to_datetime(end_date)+pd.Timedelta(days=1)).strftime("%Y-%m-%d"), progress=False)
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    df = df.reset_index()
+    df = df.rename(columns={'Date': 'date'})
+    df['date'] = pd.to_datetime(df['date']).dt.normalize()
+    
+    close_col = next((c for c in df.columns if 'close' in str(c).lower()), None)
+    if close_col is None:
+        raise RuntimeError("No close column found")
+    
+    df['close'] = df[close_col]
+    return df[['date', 'close']].copy()
+
+def add_technical_indicators(df):
+    """가격 데이터프레임에 기술적 지표를 추가하는 함수"""
+    # 이동평균선 (SMA)
+    df['SMA_12'] = df['close'].rolling(window=12).mean()
+    df['SMA_26'] = df['close'].rolling(window=26).mean()
+
+    # RSI (상대강도지수)
+    delta = df['close'].diff(1)
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / loss
+    df['RSI'] = 100 - (100 / (1 + rs))
+
+    # MACD (이동평균 수렴확산)
+    ema_12 = df['close'].ewm(span=12, adjust=False).mean()
+    ema_26 = df['close'].ewm(span=26, adjust=False).mean()
+    df['MACD'] = ema_12 - ema_26
+    df['MACD_signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
+    
+    # 골든크로스 (1), 데드크로스 (0)
+    df['SMA_cross'] = (df['SMA_12'] > df['SMA_26']).astype(int)
+    
+    # MACD 히스토그램 (MACD 값 - 시그널 값)
+    df['MACD_hist'] = df['MACD'] - df['MACD_signal']
+    
+    # RSI 과매수(1), 과매도(-1), 나머지(0)
+    df['RSI_over'] = np.where(df['RSI'] > 70, 1, np.where(df['RSI'] < 30, -1, 0))
+    
+    return df
+
+def make_lstm_dataset(X, y, seq_len):
+    X_seq, y_seq = [], []
+    for i in range(seq_len, len(X)):
+        X_seq.append(X[i-seq_len:i])
+        y_seq.append(y[i])
+    return np.array(X_seq), np.array(y_seq)
+
+
+def build_lstm_model(input_dim, units=50):
+    model = Sequential([
+        LSTM(units, input_shape=(SEQ_LEN, input_dim)),
+        Dropout(0.2),
+        Dense(1, activation='sigmoid')
+    ])
+    model.compile(optimizer=Adam(1e-3), loss='binary_crossentropy', metrics=['accuracy'])
+    return model
+
+def make_sequences(data, seq_len):
+    X = []
+    for i in range(seq_len, len(data)):
+        X.append(data[i-seq_len:i])
+    return np.array(X)
+
+def compute_metrics(y_true, y_pred, y_prob=None):
+    mask = ~pd.isna(y_pred)
+    if mask.sum() == 0:
+        return {'Accuracy': np.nan, 'Precision': np.nan, 'Recall': np.nan, 'F1': np.nan, 'AUC': np.nan}
+    
+    y_t = y_true[mask].astype(int)
+    y_p = y_pred[mask].astype(int)
+    
+    metrics = {
+        'Accuracy': accuracy_score(y_t, y_p),
+        'Precision': precision_score(y_t, y_p, zero_division=0),
+        'Recall': recall_score(y_t, y_p, zero_division=0),
+        'F1': f1_score(y_t, y_p, zero_division=0)
+    }
+    
+    if y_prob is not None and len(np.unique(y_t)) > 1:
+        metrics['AUC'] = roc_auc_score(y_t, y_prob[mask])
+    else:
+        metrics['AUC'] = np.nan
+    
+    return metrics
+
+print("=== 한국어 어휘기반 감성분석 (논문 방식) ===")
+
+# 1. 뉴스 데이터 처리 (논문 방식)
+news_data = read_and_aggregate_news_label(ROOT_DIR)
+news_data = news_data[(news_data['date'] >= pd.to_datetime(START_DATE)) & 
+                     (news_data['date'] <= pd.to_datetime(END_DATE))].reset_index(drop=True)
+
+print(f"뉴스 데이터 크기: {news_data.shape}")
+print(f"날짜 범위: {news_data['date'].min()} ~ {news_data['date'].max()}")
+print(f"평균 긍정 비율: {news_data['pos_ratio'].mean():.3f}")
+print(f"평균 부정 비율: {news_data['neg_ratio'].mean():.3f}")
+print(f"평균 중립 비율: {news_data['neu_ratio'].mean():.3f}")
+
+# 2. 가격 데이터 처리
+price_data = fetch_price_data(START_DATE, END_DATE, TICKER)
+price_data = price_data[price_data['date'] >= pd.to_datetime(START_DATE)].reset_index(drop=True)
+
+price_data= add_technical_indicators(price_data)
+
+# 3. 데이터 병합 및 타겟 생성
+df = pd.merge(price_data, news_data, on='date', how='left').sort_values('date').reset_index(drop=True)
+
+# 뉴스 없는 날은 0으로 채움
+news_cols = ['total_news', 'pos_ratio', 'neg_ratio', 'neu_ratio', 'avg_sentiment']
+df[news_cols] = df[news_cols].fillna(0)
+
+# 가격 변동률 및 타겟 생성
+df['return'] = df['close'].pct_change()
+df['target'] = (df['return'] > 0).astype(int)
+
+# 논문에서 사용한 피쳐: 1일, 2일, 3일 전 가격변동률 + 1일 시차 뉴스
+for lag in [1, 2, 3]:
+    df[f'return_lag_{lag}'] = df['return'].shift(lag)
+    df[f'pos_ratio_lag_{lag}'] = df['pos_ratio'].shift(lag)  # 1일 시차
+    df[f'neg_ratio_lag_{lag}'] = df['neg_ratio'].shift(lag)  # 1일 시차
+    df[f'avg_sentiment_lag_{lag}'] = df['avg_sentiment'].shift(lag)  # 1일 시차
+
+# 피쳐 정의 (논문 방식)
+price_features = ['return_lag_1', 'return_lag_2', 'return_lag_3','SMA_12',
+                  'SMA_26','RSI','MACD', 'MACD_signal','SMA_cross','MACD_hist','RSI_over']
+news_features = ['pos_ratio_lag_1', 'neg_ratio_lag_1', 'avg_sentiment_lag_1']  # 1일 시차만
+# 뉴스 감성 피처 추가
+df['pos_x_ret'] = df['pos_ratio_lag_1'] * df['return_lag_1']
+df['neg_x_ret'] = df['neg_ratio_lag_1'] * df['return_lag_1']
+df['sentiment_x_ret'] = df['avg_sentiment_lag_1'] * df['return_lag_1']
+df['total_news_lag_1'] = df['total_news'].shift(1)
+df['sentiment_x_volume'] = df['avg_sentiment_lag_1'] * df['total_news_lag_1']
+
+
+combined_features = price_features + news_features + ['pos_x_ret', 'neg_x_ret', 'sentiment_x_ret','sentiment_x_volume']
+
+threshold = 0.005 # 0.5%
+df['target'] = np.where(df['return'] > threshold, 1, np.where(df['return'] < -threshold, 0, np.nan))
+
+# 데이터 준비
+data_clean = df[['date'] + combined_features + ['target']].dropna().reset_index(drop=True)
+print(f"Clean data shape: {data_clean.shape}")
+
+# 학습/테스트 분할
+train_mask = data_clean['date'] <= pd.to_datetime(TRAIN_END)
+test_mask = data_clean['date'] > pd.to_datetime(TRAIN_END)
+
+X_price_train = data_clean.loc[train_mask, price_features].values
+X_price_test = data_clean.loc[test_mask, price_features].values
+X_news_train = data_clean.loc[train_mask, news_features].values
+X_news_test = data_clean.loc[test_mask, news_features].values
+X_combined_train = data_clean.loc[train_mask, combined_features].values
+X_combined_test = data_clean.loc[test_mask, combined_features].values
+
+y_train = data_clean.loc[train_mask, 'target'].values
+y_test = data_clean.loc[test_mask, 'target'].values
+
+print(f"학습 샘플: {len(y_train)}, 테스트 샘플: {len(y_test)}")
+print(f"가격 피쳐: {price_features}")
+print(f"뉴스 피쳐: {news_features}")
+
+# 감성분석 품질 체크
+sentiment_sample = data_clean['avg_sentiment_lag_1']
+print(f"\n감성 점수 분포:")
+print(f"평균: {sentiment_sample.mean():.4f}")
+print(f"표준편차: {sentiment_sample.std():.4f}")
+print(f"긍정(>0): {(sentiment_sample > 0).sum()}/{len(sentiment_sample)}")
+print(f"부정(<0): {(sentiment_sample < 0).sum()}/{len(sentiment_sample)}")
+print(f"중립(=0): {(sentiment_sample == 0).sum()}/{len(sentiment_sample)}")
+
+# 스케일링
+scaler_p = StandardScaler().fit(X_price_train)
+X_price_train_scaled = scaler_p.transform(X_price_train)
+X_price_test_scaled = scaler_p.transform(X_price_test)
+
+scaler_n = StandardScaler().fit(X_news_train)
+X_news_train_scaled = scaler_n.transform(X_news_train)
+X_news_test_scaled = scaler_n.transform(X_news_test)
+
+scaler_c = StandardScaler().fit(X_combined_train)
+X_combined_train_scaled = scaler_c.transform(X_combined_train)
+X_combined_test_scaled = scaler_c.transform(X_combined_test)
+
+# 모델 학습 및 평가
+def train_models(X_train, X_test, y_train, y_test, model_prefix):
+    results = []
+    
+    # 로지스틱 회귀
+    logit = LogisticRegression(max_iter=2000, random_state=42)
+    logit.fit(X_train, y_train)
+    pred_logit = logit.predict(X_test)
+    prob_logit = logit.predict_proba(X_test)[:, 1]
+    results.append({'Model': f'{model_prefix}_Logit', **compute_metrics(y_test, pred_logit, prob_logit)})
+    
+    # 인공신경망
+    ann = MLPClassifier(hidden_layer_sizes=(20, 10), max_iter=2000, random_state=42)
+    ann.fit(X_train, y_train)
+    pred_ann = ann.predict(X_test)
+    prob_ann = ann.predict_proba(X_test)[:, 1]
+    results.append({'Model': f'{model_prefix}_ANN', **compute_metrics(y_test, pred_ann, prob_ann)})
+    
+    # SVM
+    svm = SVC(kernel='rbf', probability=True, random_state=42)
+    svm.fit(X_train, y_train)
+    pred_svm = svm.predict(X_test)
+    prob_svm = svm.predict_proba(X_test)[:, 1]
+    results.append({'Model': f'{model_prefix}_SVM', **compute_metrics(y_test, pred_svm, prob_svm)})
+    
+    return results
+
+# LSTM 모델 (시퀀스 데이터용)
+def train_lstm_model(X_train, X_test, y_train, y_test, model_name, seq_len=SEQ_LEN):
+    if len(X_train) < seq_len:
+        return {'Model': model_name, 'Accuracy': np.nan, 'Note': 'Insufficient data for LSTM'}
+    
+    # 시퀀스 생성
+    X_train_seq, y_train_seq = make_lstm_dataset(X_train, y_train, seq_len)
+    X_test_seq, y_test_seq = make_lstm_dataset(X_test, y_test, seq_len)
+
+    if len(X_train_seq) == 0 or len(X_test_seq) == 0:
+        return {'Model': model_name, 'Accuracy': np.nan, 'Note': 'No sequences generated'}
+    
+    # LSTM 모델 구축 및 학습
+    model = build_lstm_model(X_train_seq.shape[2])
+    model.fit(X_train_seq, y_train_seq, epochs=20, batch_size=32, verbose=0)
+    
+    # 예측
+    prob_lstm = model.predict(X_test_seq, verbose=0)[:, 0]
+    pred_lstm = (prob_lstm > 0.5).astype(int)
+    
+    return {'Model': model_name, **compute_metrics(y_test_seq, pred_lstm, prob_lstm)}
+
+print("\n=== 모델 학습 및 평가 ===")
+
+# 1. 가격 기반 모델 (P_)
+price_results = train_models(X_price_train_scaled, X_price_test_scaled, y_train, y_test, 'P')
+
+# 2. 뉴스 기반 모델 (N_)
+news_results = train_models(X_news_train_scaled, X_news_test_scaled, y_train, y_test, 'N')
+
+# 3. 결합 모델 (Combined_)
+combined_results = train_models(X_combined_train_scaled, X_combined_test_scaled, y_train, y_test, 'Combined')
+
+# 4. LSTM 모델들
+lstm_price = train_lstm_model(X_price_train_scaled, X_price_test_scaled, y_train, y_test, 'P_LSTM')
+lstm_news = train_lstm_model(X_news_train_scaled, X_news_test_scaled, y_train, y_test, 'N_LSTM')
+lstm_combined = train_lstm_model(X_combined_train_scaled, X_combined_test_scaled, y_train, y_test, 'Combined_LSTM')
+
+# 결과 정리
+all_results = price_results + news_results + combined_results
+if not pd.isna(lstm_price.get('Accuracy')):
+    all_results.append(lstm_price)
+if not pd.isna(lstm_news.get('Accuracy')):
+    all_results.append(lstm_news)
+if not pd.isna(lstm_combined.get('Accuracy')):
+    all_results.append(lstm_combined)
+
+results_df = pd.DataFrame(all_results).set_index('Model').round(4)
+
+print("=== 최종 성능 비교 ===")
+print(results_df.sort_values('Accuracy', ascending=False))
+
+# 성능 개선 분석
+price_best = results_df[results_df.index.str.startswith('P_')]['Accuracy'].max()
+news_best = results_df[results_df.index.str.startswith('N_')]['Accuracy'].max()
+combined_best = results_df[results_df.index.str.startswith('Combined_')]['Accuracy'].max()
+
+print(f"\n=== 성능 개선 분석 ===")
+print(f"최고 가격 모델: {price_best:.4f}")
+print(f"최고 뉴스 모델: {news_best:.4f}")
+print(f"최고 결합 모델: {combined_best:.4f}")
+print(f"뉴스 추가 효과: {(combined_best - price_best) * 100:.2f}%")
+
+# 감성-수익률 상관관계 분석
+sentiment_corr = np.corrcoef(data_clean['avg_sentiment_lag_1'], data_clean['target'])[0, 1]
+print(f"감성-수익률 상관계수: {sentiment_corr:.4f}")
+
+if combined_best > price_best:
+    print("✓ 뉴스 감성정보가 예측성능을 향상시켰습니다!")
+else:
+    print("✗ 뉴스 감성정보가 예측성능을 저하시켰습니다.")

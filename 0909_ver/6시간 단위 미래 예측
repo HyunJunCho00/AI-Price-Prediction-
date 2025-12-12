@@ -1,0 +1,91 @@
+# 6시간 단위 미래 예측 ver
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import MinMaxScaler
+from keras.models import Sequential
+from keras.layers import LSTM, Dense
+import pyupbit
+
+# 1. 데이터 다운로드 (6시간 단위로 500개)
+df = pyupbit.get_ohlcv("KRW-ETH", interval="minute60", count=1000)  # 60분 단위 데이터 1000개
+df = df.iloc[::6]  # 6시간마다 1개 데이터 추출 (즉, 6시간 간격)
+df_close = df[['close']]  # 종가만 사용
+
+# 2. 전처리: MinMax Scaling
+scaler = MinMaxScaler()
+scaled_data = scaler.fit_transform(df_close)
+
+# 3. 시퀀스 생성 함수 (5개 구간을 input, 다음 1개 구간을 target)
+def create_sequences(data, seq_length=5):
+    xs, ys = [], []
+    for i in range(len(data) - seq_length):
+        x = data[i:i+seq_length]
+        y = data[i+seq_length]
+        xs.append(x)
+        ys.append(y)
+    return np.array(xs), np.array(ys)
+
+X, y = create_sequences(scaled_data, seq_length=5)
+
+# 4. Train/Test 분할
+split = int(len(X) * 0.8)
+X_train, X_test = X[:split], X[split:]
+y_train, y_test = y[:split], y[split:]
+
+# 5. LSTM 모델 구성
+model = Sequential()
+model.add(LSTM(50, input_shape=(X.shape[1], X.shape[2])))
+model.add(Dense(1))
+model.compile(optimizer="adam", loss="mse")
+
+# 6. 학습
+model.fit(X_train, y_train, epochs=40, batch_size=16, validation_data=(X_test, y_test), verbose=1)
+
+# 7. 예측 (테스트 구간)
+predicted = model.predict(X_test)
+predicted_prices = scaler.inverse_transform(predicted)
+actual_prices = scaler.inverse_transform(y_test)
+
+# 8. 향후 5개 타임스텝 (즉, 5 * 6시간) 예측
+def predict_next_steps(last_sequence, steps=5):
+    seq = last_sequence.copy()
+    forecasts = []
+    for _ in range(steps):
+        pred = model.predict(seq[np.newaxis, ...])
+        forecasts.append(pred[0])
+        seq = np.vstack([seq[1:], pred])
+    return scaler.inverse_transform(np.array(forecasts).reshape(-1, 1))
+
+last_seq = X_test[-1]
+future_5steps = predict_next_steps(last_seq, steps=5)
+
+print("\n## 향후 5개 타임스텝 예측 가격 (6시간 단위):")
+print(future_5steps.flatten())
+
+# 9. 상승/하락폭 출력
+diffs = np.diff(future_5steps.flatten())
+print("\n## 예측된 타임스텝별 상승/하락폭 (6시간 단위):")
+print(diffs)
+
+# 10. 시각화
+plt.figure(figsize=(14, 7))
+
+# 테스트 데이터 구간의 실제 vs 예측 가격
+test_data_index = df_close.index[split + 5:]
+plt.plot(test_data_index, actual_prices, label="Actual Price", color='blue')
+plt.plot(test_data_index, predicted_prices, label="Predicted Price (Test)", color='red', linestyle='--')
+
+# 향후 5개 스텝 예측 시간 생성 (6시간 단위)
+future_index = pd.date_range(start=test_data_index[-1] + pd.Timedelta(hours=6), periods=5, freq='6H')
+plt.plot(future_index, future_5steps, label="Future Forecast (5 x 6h)", color='green', marker='o')
+
+plt.title("ETH Price Prediction (6-hour interval)")
+plt.xlabel("Datetime")
+plt.ylabel("Price (KRW)")
+plt.legend()
+plt.grid(True)
+plt.xticks(rotation=45)
+plt.tight_layout()
+plt.show()

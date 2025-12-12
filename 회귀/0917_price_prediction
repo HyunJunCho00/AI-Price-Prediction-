@@ -1,0 +1,239 @@
+import pandas as pd
+import numpy as np
+import yfinance as yf
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_absolute_percentage_error, r2_score
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Conv1D, MaxPooling1D, Bidirectional, LSTM, Dense, Dropout
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping
+import matplotlib.pyplot as plt
+import datetime
+
+# --- 1. 데이터 획득 (Data Acquisition) ---
+def get_ethereum_data(start_date="2020-01-01", end_date="2025-09-17", ticker="ETH-USD"):
+    """
+    Yahoo Finance에서 이더리움 일일 종가 데이터를 다운로드합니다.
+    """
+    print(f"이더리움 데이터 다운로드 중: {start_date} ~ {end_date}")
+    try:
+        data = yf.download(ticker, start=start_date, end=end_date)
+        if data.empty:
+            raise ValueError("다운로드된 데이터가 없습니다. 날짜 범위 또는 티커를 확인하세요.")
+        df_close = data[['Close']]
+        print("데이터 다운로드 완료.")
+        return df_close
+    except Exception as e:
+        print(f"데이터 다운로드 중 오류 발생: {e}")
+        return pd.DataFrame()
+
+# --- 2. 데이터 전처리 (Data Preprocessing) ---
+def preprocess_data(df, timesteps=16, train_ratio=0.7, val_ratio=0.15):
+    """
+    데이터를 정규화하고, 슬라이딩 윈도우를 적용하며, 학습/검증/테스트 세트로 분할합니다.
+    """
+    print("\n데이터 전처리 시작...")
+
+    # Min-Max Scaling (0-1 범위로 정규화)
+    scaler = MinMaxScaler(feature_range=(0, 1))
+    scaled_data = scaler.fit_transform(df)
+    print("데이터 정규화 완료.")
+
+    # 슬라이딩 윈도우를 사용하여 시퀀스 데이터 생성
+    X, y = [], []
+    for i in range(timesteps, len(scaled_data)):
+        X.append(scaled_data[i-timesteps:i, 0])
+        y.append(scaled_data[i, 0])
+    X, y = np.array(X), np.array(y)
+    print(f"슬라이딩 윈도우 (timesteps={timesteps}) 적용 완료. 생성된 시퀀스 수: {len(X)}")
+
+    # 데이터 분할 (학습, 검증, 테스트)
+    total_samples = len(X)
+    train_size = int(total_samples * train_ratio)
+    val_size = int(total_samples * val_ratio)
+    test_size = total_samples - train_size - val_size
+
+    X_train, y_train = X[:train_size], y[:train_size]
+    X_val, y_val = X[train_size:train_size + val_size], y[train_size:train_size + val_size]
+    X_test, y_test = X[train_size + val_size:], y[train_size + val_size:]
+
+    print(f"학습 세트: {len(X_train)} 시퀀스")
+    print(f"검증 세트: {len(X_val)} 시퀀스")
+    print(f"테스트 세트: {len(X_test)} 시퀀스")
+
+    X_train = X_train.reshape(X_train.shape[0], X_train.shape[1], 1)
+    X_val = X_val.reshape(X_val.shape[0], X_val.shape[1], 1)
+    X_test = X_test.reshape(X_test.shape[0], X_test.shape[1], 1)
+    print(f"데이터 형태 재구성 완료. X_train.shape: {X_train.shape}")
+    
+    return X_train, y_train, X_val, y_val, X_test, y_test, scaler
+
+# --- 3. CNN-BiLSTM 모델 구축 (Building CNN-BiLSTM Model) ---
+def build_cnn_bilstm_model(timesteps, features=1):
+    """
+    논문에 제시된 CNN-BiLSTM 아키텍처를 구축합니다.
+    """
+    print("\nCNN-BiLSTM 모델 구축 시작...")
+    model = Sequential([
+        # Conv1D Layer
+        Conv1D(filters=128, kernel_size=3, activation='relu', input_shape=(timesteps, features)),
+        # MaxPooling1D Layer
+        MaxPooling1D(pool_size=2),
+        # Bidirectional LSTM Layer 1
+        Bidirectional(LSTM(units=150, return_sequences=True)),
+        # Dropout Layer
+        Dropout(0.2),
+        # Bidirectional LSTM Layer 2
+        Bidirectional(LSTM(units=50, return_sequences=False)),
+        # Dense Layer 1
+        Dense(units=64, activation='relu'),
+        # Dense Layer 2
+        Dense(units=32, activation='relu'),
+        # Output Layer
+        Dense(units=1)
+    ])
+
+    # 모델 컴파일
+    optimizer = Adam(learning_rate=0.001)
+    model.compile(optimizer=optimizer, loss='mse')
+    
+    print("모델 요약:")
+    model.summary()
+    print("모델 구축 완료.")
+    return model
+
+# --- 4. 모델 훈련 (Training Model) ---
+def train_model(model, X_train, y_train, X_val, y_val, epochs=100, batch_size=16, patience=10):
+    """
+    Early Stopping을 사용하여 모델을 훈련합니다.
+    """
+    print("\n모델 훈련 시작...")
+    early_stopping = EarlyStopping(
+        monitor='val_loss',  # 검증 손실을 모니터링
+        patience=patience,   # 10 에포크 동안 개선이 없으면 중단
+        restore_best_weights=True  # 가장 성능이 좋았던 에포크의 가중치를 복원
+    )
+
+    history = model.fit(
+        X_train, y_train,
+        epochs=epochs,
+        batch_size=batch_size,
+        validation_data=(X_val, y_val),
+        callbacks=[early_stopping],
+        verbose=1
+    )
+    print("모델 훈련 완료.")
+    return history
+
+# --- 5. 모델 평가 (Evaluating Model) ---
+def evaluate_model(model, X_test, y_test, scaler, df_original_close):
+    """
+    테스트 세트에서 모델을 평가하고 MAPE, R²를 계산합니다.
+    """
+    print("\n모델 평가 시작...")
+    
+    # 예측 수행 (정규화된 값)
+    y_pred_scaled = model.predict(X_test)
+    y_test_reshaped = y_test.reshape(-1, 1)
+    y_pred_reshaped = y_pred_scaled.reshape(-1, 1)
+
+    y_actual = scaler.inverse_transform(y_test_reshaped)
+    y_predicted = scaler.inverse_transform(y_pred_reshaped)
+    
+    # 평가 지표 계산
+    mape = mean_absolute_percentage_error(y_actual, y_predicted) * 100
+    r2 = r2_score(y_actual, y_predicted)
+
+    print(f"MAPE: {mape:.4f}%")
+    print(f"R²: {r2:.4f}")
+
+    print("모델 평가 완료.")
+    return y_actual, y_predicted, mape, r2
+
+# --- 결과 시각화 ---
+def plot_results(y_actual, y_predicted, title="Ethereum Price Prediction: Actual vs Predicted"):
+    """
+    실제 가격과 예측 가격을 시각화합니다.
+    """
+    plt.figure(figsize=(14, 7))
+    plt.plot(y_actual, label='Actual Price', color='blue')
+    plt.plot(y_predicted, label='Predicted Price', color='red', linestyle='--')
+    plt.title(title)
+    plt.xlabel('Time (Test Samples)')
+    plt.ylabel('ETH Price (USD)')
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+def plot_training_history(history):
+    """
+    훈련 손실 및 검증 손실 그래프를 그립니다.
+    """
+    plt.figure(figsize=(12, 6))
+    plt.plot(history.history['loss'], label='Train Loss')
+    plt.plot(history.history['val_loss'], label='Validation Loss')
+    plt.title('Model Loss During Training')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss (MSE)')
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+# --- 메인 실행 로직 ---
+if __name__ == "__main__":
+    # 설정 파라미터
+    START_DATE = "2020-01-01"
+    END_DATE = "2025-09-17" 
+    ETH_TICKER = "ETH-USD"
+    TIMESTEPS = 17 
+    TRAIN_RATIO = 0.7
+    VAL_RATIO = 0.15
+    EPOCHS = 100
+    BATCH_SIZE = 16
+    EARLY_STOPPING_PATIENCE = 10
+
+    # 1. 데이터 획득
+    df_ethereum = get_ethereum_data(START_DATE, END_DATE, ETH_TICKER)
+    if df_ethereum.empty:
+        print("데이터를 성공적으로 다운로드하지 못하여 프로그램을 종료합니다.")
+        exit()
+
+    # 2. 데이터 전처리
+    X_train, y_train, X_val, y_val, X_test, y_test, scaler = preprocess_data(
+        df_ethereum, 
+        timesteps=TIMESTEPS, 
+        train_ratio=TRAIN_RATIO, 
+        val_ratio=VAL_RATIO
+    )
+
+    # 3. CNN-BiLSTM 모델 구축
+    model = build_cnn_bilstm_model(timesteps=TIMESTEPS, features=X_train.shape[2])
+
+    # 4. 모델 훈련
+    history = train_model(
+        model, 
+        X_train, y_train, 
+        X_val, y_val, 
+        epochs=EPOCHS, 
+        batch_size=BATCH_SIZE, 
+        patience=EARLY_STOPPING_PATIENCE
+    )
+    plot_training_history(history)
+
+    # 5. 모델 평가
+    y_actual, y_predicted, mape_result, r2_result = evaluate_model(model, X_test, y_test, scaler, df_ethereum)
+    plot_results(y_actual, y_predicted)
+
+    print(f"\n--- 최종 예측 결과 ---")
+    print(f"본 코드 실행 결과 MAPE: {mape_result:.4f}%")
+    print(f"본 코드 실행 결과 R²: {r2_result:.4f}")
+
+    # 추가 분석: 오차 트렌드 시각화
+    plt.figure(figsize=(14, 7))
+    plt.plot(y_actual - y_predicted, label='Prediction Error', color='green')
+    plt.title('Prediction Error Trend Over Time (Test Set)')
+    plt.xlabel('Time (Test Samples)')
+    plt.ylabel('Error (Actual - Predicted)')
+    plt.legend()
+    plt.grid(True)
+    plt.show()

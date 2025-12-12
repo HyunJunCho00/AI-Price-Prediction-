@@ -1,0 +1,93 @@
+# 재귀 방식 LSTM
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import MinMaxScaler
+from keras.models import Sequential
+from keras.layers import LSTM, Dense
+import pyupbit
+
+# 1. 데이터 다운로드 (업비트에서 일별 데이터 가져오기)
+df = pyupbit.get_ohlcv("KRW-ETH", interval="day", count=500)  # 최근 500일 데이터
+df_close = df[['close']]  # 종가만 사용
+
+# 2. 전처리: MinMax Scaling
+scaler = MinMaxScaler()
+scaled_data = scaler.fit_transform(df_close)
+
+# 3. 시퀀스 생성 함수 (5일치 데이터를 input, 다음날 종가를 target)
+def create_sequences(data, seq_length=5):
+    xs, ys = [], []
+    for i in range(len(data) - seq_length):
+        x = data[i:i+seq_length]
+        y = data[i+seq_length]
+        xs.append(x)
+        ys.append(y)
+    return np.array(xs), np.array(ys)
+
+X, y = create_sequences(scaled_data, seq_length=5)
+
+# 4. Train/Test 분할
+split = int(len(X) * 0.8)
+X_train, X_test = X[:split], X[split:]
+y_train, y_test = y[:split], y[split:]
+
+# 5. LSTM 모델 구성
+model = Sequential()
+# [수정] input_shape을 (X.shape[1], X.shape[2])로 올바르게 지정
+# [개선] activation 함수를 기본값인 'tanh'로 변경 (일반적으로 더 나은 성능)
+model.add(LSTM(50, input_shape=(X.shape[1], X.shape[2])))
+model.add(Dense(1))
+model.compile(optimizer="adam", loss="mse")
+
+# 6. 학습
+model.fit(X_train, y_train, epochs=40, batch_size=16, validation_data=(X_test, y_test), verbose=1)
+
+# 7. 예측 (테스트 구간)
+predicted = model.predict(X_test)
+predicted_prices = scaler.inverse_transform(predicted)
+actual_prices = scaler.inverse_transform(y_test)
+
+# 8. 향후 5일 예측 (recursive)
+def predict_next_days(last_sequence, days=5):
+    seq = last_sequence.copy()
+    forecasts = []
+    for _ in range(days):
+        # 모델 예측을 위해 배치 차원 추가 (1, 5, 1)
+        pred = model.predict(seq[np.newaxis, ...])
+        forecasts.append(pred[0]) # 예측값 저장
+        # 가장 오래된 값을 빼고, 새로운 예측값을 시퀀스에 추가
+        seq = np.vstack([seq[1:], pred])
+    # [수정] inverse_transform을 위해 2D 배열로 reshape
+    return scaler.inverse_transform(np.array(forecasts).reshape(-1, 1))
+
+last_seq = X_test[-1]
+future_5days = predict_next_days(last_seq, days=5)
+
+print("\n## 향후 5일 예측 가격:")
+print(future_5days.flatten())
+
+# 9. 상승/하락폭 출력
+diffs = np.diff(future_5days.flatten())
+print("\n## 예측된 일별 상승/하락폭:")
+print(diffs)
+
+# 10. 시각화
+plt.figure(figsize=(14, 7))
+
+# 테스트 데이터 구간의 실제 vs 예측 가격
+test_data_index = df_close.index[split + 5:]
+plt.plot(test_data_index, actual_prices, label="Actual Price", color='blue')
+plt.plot(test_data_index, predicted_prices, label="Predicted Price (Test)", color='red', linestyle='--')
+
+# 향후 5일 예측
+future_index = pd.date_range(start=test_data_index[-1] + pd.Timedelta(days=1), periods=5)
+plt.plot(future_index, future_5days, label="Future Forecast (5 days)", color='green', marker='o')
+
+plt.title("ETH Price Prediction")
+plt.xlabel("Date")
+plt.ylabel("Price (KRW)")
+plt.legend()
+plt.grid(True)
+plt.show()

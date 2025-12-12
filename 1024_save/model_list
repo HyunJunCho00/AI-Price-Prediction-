@@ -1,0 +1,2295 @@
+import numpy as np
+import pandas as pd
+import optuna
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.svm import SVC
+from lightgbm import LGBMClassifier
+from lightgbm.callback import early_stopping
+from xgboost import XGBClassifier
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout, BatchNormalization
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+from tensorflow.keras.regularizers import l2
+import warnings
+warnings.filterwarnings('ignore')
+
+
+class TimeSeriesAugmentation:
+    """
+    시계열 데이터 증강을 위한 유틸리티 클래스
+    """
+    
+    @staticmethod
+    def jittering(X, sigma=0.02):
+        """
+        가우시안 노이즈 추가
+        """
+        noise = np.random.normal(0, sigma, X.shape)
+        return X + noise
+    
+    @staticmethod
+    def scaling(X, sigma=0.1):
+        """
+        랜덤 스케일링 적용
+        """
+        if len(X.shape) == 3:
+            factor = np.random.normal(1, sigma, (X.shape[0], 1, X.shape[2]))
+        else:
+            factor = np.random.normal(1, sigma, (X.shape[0], X.shape[1]))
+        return X * factor
+    
+    @staticmethod
+    def magnitude_warping(X, sigma=0.2, num_knots=4):
+        """
+        진폭 왜곡 적용
+        """
+        if len(X.shape) == 3:
+            seq_len = X.shape[1]
+            orig_steps = np.linspace(0, seq_len - 1, num_knots + 2)
+            random_warps = np.random.normal(1, sigma, size=(X.shape[0], num_knots + 2, X.shape[2]))
+            
+            warped_X = np.zeros_like(X)
+            for i in range(X.shape[0]):
+                for j in range(X.shape[2]):
+                    warper = np.interp(np.arange(seq_len), orig_steps, random_warps[i, :, j])
+                    warped_X[i, :, j] = X[i, :, j] * warper
+            return warped_X
+        else:
+            return X * np.random.normal(1, sigma, X.shape)
+    
+    @staticmethod
+    def apply_augmentation(X, method='jittering', **kwargs):
+        """
+        선택된 증강 기법 적용
+        """
+        if method == 'jittering':
+            return TimeSeriesAugmentation.jittering(X, **kwargs)
+        elif method == 'scaling':
+            return TimeSeriesAugmentation.scaling(X, **kwargs)
+        elif method == 'magnitude_warping':
+            return TimeSeriesAugmentation.magnitude_warping(X, **kwargs)
+        else:
+            return X
+
+
+class DirectionModels:
+    """
+    이더리움 가격 방향성 예측을 위한 머신러닝 모델 클래스
+    과적합 방지를 위한 정규화 기법 강화
+    """
+    
+    @staticmethod
+    def random_forest(X_train, y_train, X_val, y_val):
+        """
+        Random Forest 분류기 with 강화된 정규화
+        GridSearchCV 대신 Optuna 사용으로 속도 개선 및 과적합 방지 강화
+        """
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+        
+        def objective(trial):
+            # 보수적인 하이퍼파라미터 범위 - 복잡도 제한
+            param = {
+                'n_estimators': trial.suggest_int('n_estimators', 50, 150),
+                'max_depth': trial.suggest_int('max_depth', 6, 12),  # 깊이 제한
+                'min_samples_split': trial.suggest_int('min_samples_split', 20, 40),  # 높은 값으로 제한
+                'min_samples_leaf': trial.suggest_int('min_samples_leaf', 8, 15),  # 높은 값으로 제한
+                'max_features': trial.suggest_categorical('max_features', ['sqrt', 'log2']),
+                'max_samples': trial.suggest_float('max_samples', 0.6, 0.8),
+                'max_leaf_nodes': trial.suggest_int('max_leaf_nodes', 50, 120),
+                'ccp_alpha': trial.suggest_float('ccp_alpha', 0.0, 0.01),  # 가지치기 파라미터
+                'random_state': 42,
+                'n_jobs': -1,
+                'bootstrap': True
+            }
+            
+            model = RandomForestClassifier(**param)
+            model.fit(X_train, y_train)
+            
+            # Validation 성능으로만 평가
+            val_acc = model.score(X_val, y_val)
+            
+            return val_acc
+        
+        study = optuna.create_study(
+            direction='maximize',
+            sampler=optuna.samplers.TPESampler(seed=42, n_startup_trials=10),
+            pruner=optuna.pruners.MedianPruner(
+                n_startup_trials=5,
+                n_warmup_steps=0
+            )
+        )
+        
+        study.optimize(objective, n_trials=25, show_progress_bar=False, n_jobs=1)
+        
+        # 최종 모델 학습
+        best_model = RandomForestClassifier(**study.best_params, random_state=42, n_jobs=-1, bootstrap=True)
+        best_model.fit(X_train, y_train)
+        
+        # 과적합 체크 출력
+        train_acc = best_model.score(X_train, y_train)
+        val_acc = best_model.score(X_val, y_val)
+        print(f"[Random Forest] Train Acc: {train_acc:.4f} | Val Acc: {val_acc:.4f} | Gap: {train_acc - val_acc:.4f}")
+        
+        return best_model
+    
+    @staticmethod
+    def lightgbm(X_train, y_train, X_val, y_val):
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+        def objective(trial):
+            params = {
+                'n_estimators': trial.suggest_int('n_estimators', 100, 300),
+                'max_depth': trial.suggest_int('max_depth', 3, 8),
+                'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.1, log=True),
+                'num_leaves': trial.suggest_int('num_leaves', 20, 100),
+                'subsample': trial.suggest_float('subsample', 0.5, 1.0),
+                'colsample_bytree': trial.suggest_float('colsample_bytree', 0.5, 1.0),
+                'reg_alpha': trial.suggest_float('reg_alpha', 0.01, 10.0, log=True),
+                'reg_lambda': trial.suggest_float('reg_lambda', 0.01, 10.0, log=True),
+                'min_child_samples': trial.suggest_int('min_child_samples', 20, 100),
+                'min_child_weight': trial.suggest_float('min_child_weight', 0.001, 10.0, log=True),
+                'min_split_gain': trial.suggest_float('min_split_gain', 0.001, 1.0, log=True),
+                'path_smooth': trial.suggest_float('path_smooth', 0.0, 1.0),
+                'feature_fraction': trial.suggest_float('feature_fraction', 0.5, 1.0),
+                'bagging_fraction': trial.suggest_float('bagging_fraction', 0.5, 1.0),
+                'bagging_freq': 1,
+                'random_state': 42,
+                'verbose': -1,
+                'force_col_wise': True
+            }
+
+            model = LGBMClassifier(**params)
+            model.fit(
+                X_train, y_train,
+                eval_set=[(X_val, y_val)],
+                eval_metric='binary_logloss',
+                callbacks=[early_stopping(stopping_rounds=30, verbose=False)]
+            )
+
+            y_val_pred = model.predict(X_val)
+            return accuracy_score(y_val, y_val_pred)
+
+        study = optuna.create_study(
+            direction='maximize',
+            sampler=optuna.samplers.TPESampler(seed=42, n_startup_trials=5),
+            pruner=optuna.pruners.MedianPruner(n_startup_trials=3, n_warmup_steps=5)
+        )
+
+        study.optimize(objective, n_trials=30, show_progress_bar=False)
+
+        best_params = study.best_params
+        best_params['random_state'] = 42
+        best_params['verbose'] = -1
+        best_params['force_col_wise'] = True
+        best_params['bagging_freq'] = 1
+
+        final_model = LGBMClassifier(**best_params)
+        final_model.fit(
+            X_train, y_train,
+            eval_set=[(X_val, y_val)],
+            eval_metric='binary_logloss',
+            callbacks=[early_stopping(stopping_rounds=30, verbose=False)]
+        )
+
+        train_pred = final_model.predict(X_train)
+        val_pred = final_model.predict(X_val)
+        train_acc = accuracy_score(y_train, train_pred)
+        val_acc = accuracy_score(y_val, val_pred)
+        print(f"[LightGBM] Train Acc: {train_acc:.4f} | Val Acc: {val_acc:.4f} | Gap: {train_acc - val_acc:.4f}")
+
+        return final_model
+
+
+    @staticmethod
+    def xgboost(X_train, y_train, X_val, y_val):
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+        def objective(trial):
+            params = {
+                'n_estimators': trial.suggest_int('n_estimators', 100, 300),
+                'max_depth': trial.suggest_int('max_depth', 3, 8),
+                'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.1, log=True),
+                'subsample': trial.suggest_float('subsample', 0.5, 1.0),
+                'colsample_bytree': trial.suggest_float('colsample_bytree', 0.5, 1.0),
+                'colsample_bylevel': trial.suggest_float('colsample_bylevel', 0.5, 1.0),
+                'colsample_bynode': trial.suggest_float('colsample_bynode', 0.5, 1.0),
+                'reg_alpha': trial.suggest_float('reg_alpha', 0.01, 10.0, log=True),
+                'reg_lambda': trial.suggest_float('reg_lambda', 0.01, 10.0, log=True),
+                'min_child_weight': trial.suggest_int('min_child_weight', 1, 20),
+                'gamma': trial.suggest_float('gamma', 0.01, 1.0, log=True),
+                'max_delta_step': trial.suggest_float('max_delta_step', 0, 5),
+                'scale_pos_weight': trial.suggest_float('scale_pos_weight', 0.5, 2.0),
+                'random_state': 42,
+                'n_jobs': -1,
+                'tree_method': 'hist',
+                'eval_metric': 'logloss'
+            }
+
+            model = XGBClassifier(**params)
+            model.fit(
+                X_train, y_train,
+                eval_set=[(X_val, y_val)],
+                verbose=False
+            )
+
+            y_val_pred = model.predict(X_val)
+            return accuracy_score(y_val, y_val_pred)
+
+        study = optuna.create_study(
+            direction='maximize',
+            sampler=optuna.samplers.TPESampler(seed=42, n_startup_trials=5),
+            pruner=optuna.pruners.MedianPruner(n_startup_trials=3, n_warmup_steps=5)
+        )
+
+        study.optimize(objective, n_trials=30, show_progress_bar=False)
+
+        best_params = study.best_params
+        best_params['random_state'] = 42
+        best_params['n_jobs'] = -1
+        best_params['tree_method'] = 'hist'
+        best_params['eval_metric'] = 'logloss'
+
+        final_model = XGBClassifier(**best_params)
+        final_model.fit(
+            X_train, y_train,
+            eval_set=[(X_val, y_val)],
+            verbose=False
+        )
+
+        train_pred = final_model.predict(X_train)
+        val_pred = final_model.predict(X_val)
+        train_acc = accuracy_score(y_train, train_pred)
+        val_acc = accuracy_score(y_val, val_pred)
+        print(f"[XGBoost] Train Acc: {train_acc:.4f} | Val Acc: {val_acc:.4f} | Gap: {train_acc - val_acc:.4f}")
+
+        return final_model
+
+    @staticmethod
+    def svm(X_train, y_train, X_val, y_val):
+        """
+        Support Vector Machine 분류기
+        GridSearchCV 대신 Optuna 사용으로 속도 개선
+        """
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+        
+        def objective(trial):
+            param = {
+                'C': trial.suggest_float('C', 0.01, 10.0, log=True),  # 정규화 강도
+                'gamma': trial.suggest_float('gamma', 0.0001, 0.1, log=True),
+                'kernel': 'rbf',
+                'probability': True,
+                'random_state': 42,
+                'cache_size': 1000,
+                'max_iter': 1000
+            }
+            
+            model = SVC(**param)
+            model.fit(X_train, y_train)
+            
+            val_acc = model.score(X_val, y_val)
+            return val_acc
+        
+        study = optuna.create_study(
+            direction='maximize',
+            sampler=optuna.samplers.TPESampler(seed=42, n_startup_trials=8),
+            pruner=optuna.pruners.MedianPruner(n_startup_trials=3)
+        )
+        
+        study.optimize(objective, n_trials=20, show_progress_bar=False)
+        
+        # 최종 모델 학습
+        best_model = SVC(**study.best_params, random_state=42, probability=True, cache_size=1000)
+        best_model.fit(X_train, y_train)
+        
+        # 과적합 체크 출력
+        train_acc = best_model.score(X_train, y_train)
+        val_acc = best_model.score(X_val, y_val)
+        print(f"[SVM] Train Acc: {train_acc:.4f} | Val Acc: {val_acc:.4f} | Gap: {train_acc - val_acc:.4f}")
+        
+        return best_model
+
+    
+    @staticmethod
+    def tabnet(X_train, y_train, X_val, y_val):
+        try:
+            import torch
+            from pytorch_tabnet.tab_model import TabNetClassifier
+        except ImportError:
+            raise ImportError("pytorch-tabnet and torch required. Install with: pip install pytorch-tabnet torch")
+
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+        def objective(trial):
+            n_d = trial.suggest_int('n_d', 8, 32, step=8)
+            n_a = trial.suggest_int('n_a', 8, 32, step=8)
+            n_steps = trial.suggest_int('n_steps', 3, 6)
+            gamma = trial.suggest_float('gamma', 1.0, 1.5)
+            lambda_sparse = trial.suggest_float('lambda_sparse', 0.0001, 0.01, log=True)
+            momentum = trial.suggest_float('momentum', 0.01, 0.1)
+            clip_value = trial.suggest_float('clip_value', 0.5, 2.0)
+            n_independent = trial.suggest_int('n_independent', 2, 4)
+            n_shared = trial.suggest_int('n_shared', 2, 4)
+            lr = trial.suggest_float('lr', 0.005, 0.02, log=True)
+
+            model = TabNetClassifier(
+                n_d=n_d,
+                n_a=n_a,
+                n_steps=n_steps,
+                gamma=gamma,
+                lambda_sparse=lambda_sparse,
+                momentum=momentum,
+                clip_value=clip_value,
+                n_independent=n_independent,
+                n_shared=n_shared,
+                optimizer_fn=torch.optim.Adam,
+                optimizer_params=dict(lr=lr),
+                scheduler_fn=torch.optim.lr_scheduler.StepLR,
+                scheduler_params=dict(step_size=10, gamma=0.9),
+                mask_type='sparsemax',
+                verbose=0,
+                seed=42
+            )
+
+            model.fit(
+                X_train.values if hasattr(X_train, 'values') else X_train,
+                y_train,
+                eval_set=[(X_val.values if hasattr(X_val, 'values') else X_val, y_val)],
+                eval_metric=['accuracy'],
+                max_epochs=50,
+                patience=10,
+                batch_size=256,
+                virtual_batch_size=128
+            )
+
+            val_pred = model.predict(X_val.values if hasattr(X_val, 'values') else X_val)
+            val_acc = accuracy_score(y_val, val_pred)
+            return val_acc
+
+        study = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler(seed=42, n_startup_trials=3))
+        study.optimize(objective, n_trials=8, show_progress_bar=False)
+
+        best_params = study.best_params
+
+        model = TabNetClassifier(
+            n_d=best_params['n_d'],
+            n_a=best_params['n_a'],
+            n_steps=best_params['n_steps'],
+            gamma=best_params['gamma'],
+            lambda_sparse=best_params['lambda_sparse'],
+            momentum=best_params['momentum'],
+            clip_value=best_params['clip_value'],
+            n_independent=best_params['n_independent'],
+            n_shared=best_params['n_shared'],
+            optimizer_fn=torch.optim.Adam,
+            optimizer_params=dict(lr=best_params['lr']),
+            scheduler_fn=torch.optim.lr_scheduler.StepLR,
+            scheduler_params=dict(step_size=10, gamma=0.9),
+            mask_type='sparsemax',
+            verbose=0,
+            seed=42
+        )
+
+        model.fit(
+            X_train.values if hasattr(X_train, 'values') else X_train,
+            y_train,
+            eval_set=[(X_val.values if hasattr(X_val, 'values') else X_val, y_val)],
+            eval_metric=['accuracy'],
+            max_epochs=100,
+            patience=15,
+            batch_size=256,
+            virtual_batch_size=128
+        )
+
+        train_pred = model.predict(X_train.values if hasattr(X_train, 'values') else X_train)
+        val_pred = model.predict(X_val.values if hasattr(X_val, 'values') else X_val)
+
+        train_acc = accuracy_score(y_train, train_pred)
+        val_acc = accuracy_score(y_val, val_pred)
+        print(f"[TabNet] Train Acc: {train_acc:.4f} | Val Acc: {val_acc:.4f} | Gap: {train_acc - val_acc:.4f}")
+
+        return model
+
+    
+    
+    @staticmethod
+    def logistic_regression(X_train, y_train, X_val, y_val):
+        """
+        Logistic Regression 분류기 with 정규화
+        GridSearchCV 대신 Optuna 사용
+        """
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+        
+        def objective(trial):
+            param = {
+                'C': trial.suggest_float('C', 0.001, 10.0, log=True),
+                'penalty': 'l2',
+                'solver': trial.suggest_categorical('solver', ['lbfgs', 'saga']),
+                'max_iter': 2000,
+                'random_state': 42,
+                'n_jobs': -1
+            }
+            
+            model = LogisticRegression(**param)
+            model.fit(X_train, y_train)
+            
+            val_acc = model.score(X_val, y_val)
+            return val_acc
+        
+        study = optuna.create_study(
+            direction='maximize',
+            sampler=optuna.samplers.TPESampler(seed=42, n_startup_trials=5)
+        )
+        
+        study.optimize(objective, n_trials=15, show_progress_bar=False)
+        
+        best_model = LogisticRegression(**study.best_params)
+        best_model.fit(X_train, y_train)
+        
+        # 과적합 체크
+        train_acc = best_model.score(X_train, y_train)
+        val_acc = best_model.score(X_val, y_val)
+        print(f"[Logistic Regression] Train Acc: {train_acc:.4f} | Val Acc: {val_acc:.4f} | Gap: {train_acc - val_acc:.4f}")
+        
+        return best_model
+    
+    @staticmethod
+    def naive_bayes(X_train, y_train, X_val, y_val):
+        """
+        Gaussian Naive Bayes 분류기
+        단순 모델이므로 과적합 위험 낮음
+        """
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+        
+        def objective(trial):
+            var_smoothing = trial.suggest_float('var_smoothing', 1e-10, 1e-6, log=True)
+            
+            model = GaussianNB(var_smoothing=var_smoothing)
+            model.fit(X_train, y_train)
+            
+            val_acc = model.score(X_val, y_val)
+            return val_acc
+        
+        study = optuna.create_study(
+            direction='maximize',
+            sampler=optuna.samplers.TPESampler(seed=42)
+        )
+        
+        study.optimize(objective, n_trials=10, show_progress_bar=False)
+        
+        model = GaussianNB(var_smoothing=study.best_params['var_smoothing'])
+        model.fit(X_train, y_train)
+        
+        # 과적합 체크
+        train_acc = model.score(X_train, y_train)
+        val_acc = model.score(X_val, y_val)
+        print(f"[Naive Bayes] Train Acc: {train_acc:.4f} | Val Acc: {val_acc:.4f} | Gap: {train_acc - val_acc:.4f}")
+        
+        return model
+    
+    @staticmethod
+    def knn(X_train, y_train, X_val, y_val):
+        """
+        K-Nearest Neighbors 분류기
+        GridSearchCV 대신 Optuna 사용
+        """
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+        
+        def objective(trial):
+            param = {
+                'n_neighbors': trial.suggest_int('n_neighbors', 5, 15),
+                'weights': trial.suggest_categorical('weights', ['uniform', 'distance']),
+                'metric': trial.suggest_categorical('metric', ['euclidean', 'manhattan', 'minkowski']),
+                'leaf_size': trial.suggest_int('leaf_size', 20, 50),
+                'n_jobs': -1
+            }
+            
+            model = KNeighborsClassifier(**param)
+            model.fit(X_train, y_train)
+            
+            val_acc = model.score(X_val, y_val)
+            return val_acc
+        
+        study = optuna.create_study(
+            direction='maximize',
+            sampler=optuna.samplers.TPESampler(seed=42, n_startup_trials=5)
+        )
+        
+        study.optimize(objective, n_trials=20, show_progress_bar=False)
+        
+        best_model = KNeighborsClassifier(**study.best_params)
+        best_model.fit(X_train, y_train)
+        
+        # 과적합 체크
+        train_acc = best_model.score(X_train, y_train)
+        val_acc = best_model.score(X_val, y_val)
+        print(f"[KNN] Train Acc: {train_acc:.4f} | Val Acc: {val_acc:.4f} | Gap: {train_acc - val_acc:.4f}")
+        
+        return best_model
+    
+    @staticmethod
+    def adaboost(X_train, y_train, X_val, y_val):
+        """
+        AdaBoost 분류기 with 정규화
+        과적합 취약하므로 보수적 설정
+        """
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+        
+        def objective(trial):
+            param = {
+                'n_estimators': trial.suggest_int('n_estimators', 30, 100),  # 더 작게
+                'learning_rate': trial.suggest_float('learning_rate', 0.3, 1.0),  # 낮은 학습률
+                'algorithm': 'SAMME',
+                'random_state': 42
+            }
+            
+            # Base estimator를 더 보수적으로 설정
+            base_estimator = DecisionTreeClassifier(
+                max_depth=2,  # 매우 얕게
+                min_samples_split=30,
+                min_samples_leaf=15,
+                random_state=42
+            )
+            
+            model = AdaBoostClassifier(estimator=base_estimator, **param)
+            model.fit(X_train, y_train)
+            
+            val_acc = model.score(X_val, y_val)
+            return val_acc
+        
+        study = optuna.create_study(
+            direction='maximize',
+            sampler=optuna.samplers.TPESampler(seed=42, n_startup_trials=5)
+        )
+        
+        study.optimize(objective, n_trials=15, show_progress_bar=False)
+        
+        base_estimator = DecisionTreeClassifier(
+            max_depth=2,
+            min_samples_split=30,
+            min_samples_leaf=15,
+            random_state=42
+        )
+        
+        best_model = AdaBoostClassifier(estimator=base_estimator, **study.best_params)
+        best_model.fit(X_train, y_train)
+        
+        # 과적합 체크
+        train_acc = best_model.score(X_train, y_train)
+        val_acc = best_model.score(X_val, y_val)
+        print(f"[AdaBoost] Train Acc: {train_acc:.4f} | Val Acc: {val_acc:.4f} | Gap: {train_acc - val_acc:.4f}")
+        
+        return best_model
+    
+    @staticmethod
+    def catboost(X_train, y_train, X_val, y_val):
+        """
+        CatBoost 분류기 with 강화된 정규화
+        """
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+        
+        def objective(trial):
+            param = {
+                'iterations': trial.suggest_int('iterations', 100, 300),
+                'learning_rate': trial.suggest_float('learning_rate', 0.005, 0.05, log=True),  # 더 낮은 학습률
+                'depth': trial.suggest_int('depth', 3, 6),  # 얕은 깊이
+                'l2_leaf_reg': trial.suggest_float('l2_leaf_reg', 3.0, 10.0),  # 강한 L2
+                'border_count': trial.suggest_int('border_count', 32, 128),
+                'bagging_temperature': trial.suggest_float('bagging_temperature', 0.0, 1.0),
+                'random_strength': trial.suggest_float('random_strength', 1.0, 3.0),  # 더 강한 랜덤성
+                'subsample': trial.suggest_float('subsample', 0.5, 0.8),  # 서브샘플링 추가
+                'rsm': trial.suggest_float('rsm', 0.5, 0.8),  # 특성 샘플링 추가
+                'min_data_in_leaf': trial.suggest_int('min_data_in_leaf', 20, 50),  # 리프 노드 최소 샘플
+                'random_seed': 42,
+                'verbose': False,
+                'early_stopping_rounds': 50
+            }
+            
+            model = CatBoostClassifier(**param)
+            model.fit(
+                X_train, y_train,
+                eval_set=(X_val, y_val),
+                verbose=False
+            )
+            
+            val_acc = model.score(X_val, y_val)
+            return val_acc
+        
+        study = optuna.create_study(
+            direction='maximize',
+            sampler=optuna.samplers.TPESampler(seed=42, n_startup_trials=10),
+            pruner=optuna.pruners.MedianPruner(
+                n_startup_trials=5,
+                n_warmup_steps=10
+            )
+        )
+        
+        study.optimize(objective, n_trials=30, show_progress_bar=False)
+        
+        model = CatBoostClassifier(**study.best_params, random_seed=42, verbose=False)
+        model.fit(
+            X_train, y_train,
+            eval_set=(X_val, y_val),
+            verbose=False
+        )
+        
+        # 과적합 체크
+        train_acc = model.score(X_train, y_train)
+        val_acc = model.score(X_val, y_val)
+        print(f"[CatBoost] Train Acc: {train_acc:.4f} | Val Acc: {val_acc:.4f} | Gap: {train_acc - val_acc:.4f}")
+        
+        return model
+    
+    @staticmethod
+    def decision_tree(X_train, y_train, X_val, y_val):
+        """
+        Decision Tree 분류기 with 강화된 정규화
+        Decision Tree는 과적합에 매우 취약 - 강력한 제약 필수
+        """
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+        
+        def objective(trial):
+            param = {
+                'max_depth': trial.suggest_int('max_depth', 5, 10),  # 매우 얕게
+                'min_samples_split': trial.suggest_int('min_samples_split', 30, 60),  # 높은 값
+                'min_samples_leaf': trial.suggest_int('min_samples_leaf', 15, 30),  # 높은 값
+                'criterion': trial.suggest_categorical('criterion', ['gini', 'entropy']),
+                'max_leaf_nodes': trial.suggest_int('max_leaf_nodes', 30, 80),  # 제한적
+                'min_impurity_decrease': trial.suggest_float('min_impurity_decrease', 0.0, 0.01),  # 불순도 감소 요구
+                'ccp_alpha': trial.suggest_float('ccp_alpha', 0.0, 0.02),  # 가지치기
+                'random_state': 42
+            }
+            
+            model = DecisionTreeClassifier(**param)
+            model.fit(X_train, y_train)
+            
+            val_acc = model.score(X_val, y_val)
+            return val_acc
+        
+        study = optuna.create_study(
+            direction='maximize',
+            sampler=optuna.samplers.TPESampler(seed=42, n_startup_trials=8)
+        )
+        
+        study.optimize(objective, n_trials=25, show_progress_bar=False)
+        
+        best_model = DecisionTreeClassifier(**study.best_params)
+        best_model.fit(X_train, y_train)
+        
+        # 과적합 체크
+        train_acc = best_model.score(X_train, y_train)
+        val_acc = best_model.score(X_val, y_val)
+        print(f"[Decision Tree] Train Acc: {train_acc:.4f} | Val Acc: {val_acc:.4f} | Gap: {train_acc - val_acc:.4f}")
+        
+        return best_model
+    
+    @staticmethod
+    def extra_trees(X_train, y_train, X_val, y_val):
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+        def objective(trial):
+            param = {
+                'n_estimators': trial.suggest_int('n_estimators', 50, 150),
+                'max_depth': trial.suggest_int('max_depth', 6, 12),
+                'min_samples_split': trial.suggest_int('min_samples_split', 20, 40),
+                'min_samples_leaf': trial.suggest_int('min_samples_leaf', 10, 20),
+                'max_features': trial.suggest_categorical('max_features', ['sqrt', 'log2']),
+                'max_leaf_nodes': trial.suggest_int('max_leaf_nodes', 50, 120),
+                'min_impurity_decrease': trial.suggest_float('min_impurity_decrease', 0.0, 0.01),
+                'ccp_alpha': trial.suggest_float('ccp_alpha', 0.0, 0.01),
+                'random_state': 42,
+                'n_jobs': -1
+            }
+
+            model = ExtraTreesClassifier(**param)
+            model.fit(X_train, y_train)
+
+            val_acc = model.score(X_val, y_val)
+            return val_acc
+
+        study = optuna.create_study(
+            direction='maximize',
+            sampler=optuna.samplers.TPESampler(seed=42, n_startup_trials=10)
+        )
+
+        study.optimize(objective, n_trials=25, show_progress_bar=False)
+
+        best_model = ExtraTreesClassifier(**study.best_params)
+        best_model.fit(X_train, y_train)
+
+        train_acc = best_model.score(X_train, y_train)
+        val_acc = best_model.score(X_val, y_val)
+        print(f"[Extra Trees] Train Acc: {train_acc:.4f} | Val Acc: {val_acc:.4f} | Gap: {train_acc - val_acc:.4f}")
+
+        return best_model
+
+    @staticmethod
+    def bagging(X_train, y_train, X_val, y_val):
+        """
+        Bagging 분류기 with 정규화
+        GridSearchCV 대신 Optuna 사용
+        """
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+        
+        def objective(trial):
+            # Base estimator 설정
+            base_max_depth = trial.suggest_int('base_max_depth', 6, 12)
+            base_min_samples_split = trial.suggest_int('base_min_samples_split', 20, 40)
+            base_min_samples_leaf = trial.suggest_int('base_min_samples_leaf', 10, 20)
+            
+            base_estimator = DecisionTreeClassifier(
+                max_depth=base_max_depth,
+                min_samples_split=base_min_samples_split,
+                min_samples_leaf=base_min_samples_leaf,
+                random_state=42
+            )
+            
+            param = {
+                'n_estimators': trial.suggest_int('n_estimators', 50, 150),
+                'max_samples': trial.suggest_float('max_samples', 0.6, 0.9),
+                'max_features': trial.suggest_float('max_features', 0.6, 0.9),
+                'bootstrap': True,
+                'random_state': 42,
+                'n_jobs': -1
+            }
+            
+            model = BaggingClassifier(estimator=base_estimator, **param)
+            model.fit(X_train, y_train)
+            
+            val_acc = model.score(X_val, y_val)
+            return val_acc
+        
+        study = optuna.create_study(
+            direction='maximize',
+            sampler=optuna.samplers.TPESampler(seed=42, n_startup_trials=8)
+        )
+        
+        study.optimize(objective, n_trials=20, show_progress_bar=False)
+        
+        best_params = study.best_params
+        base_estimator = DecisionTreeClassifier(
+            max_depth=best_params['base_max_depth'],
+            min_samples_split=best_params['base_min_samples_split'],
+            min_samples_leaf=best_params['base_min_samples_leaf'],
+            random_state=42
+        )
+        
+        best_model = BaggingClassifier(
+            estimator=base_estimator,
+            n_estimators=best_params['n_estimators'],
+            max_samples=best_params['max_samples'],
+            max_features=best_params['max_features'],
+            bootstrap=True,
+            random_state=42,
+            n_jobs=-1
+        )
+        best_model.fit(X_train, y_train)
+        
+        # 과적합 체크
+        train_acc = best_model.score(X_train, y_train)
+        val_acc = best_model.score(X_val, y_val)
+        print(f"[Bagging] Train Acc: {train_acc:.4f} | Val Acc: {val_acc:.4f} | Gap: {train_acc - val_acc:.4f}")
+        
+        return best_model
+    
+    @staticmethod
+    def gradient_boosting(X_train, y_train, X_val, y_val):
+        """
+        Gradient Boosting 분류기 with 강화된 정규화
+        GridSearchCV 대신 Optuna 사용
+        """
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+        
+        def objective(trial):
+            param = {
+                'n_estimators': trial.suggest_int('n_estimators', 100, 300),
+                'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.1, log=True),  # 낮은 학습률
+                'max_depth': trial.suggest_int('max_depth', 3, 6),  # 얕은 트리
+                'subsample': trial.suggest_float('subsample', 0.5, 0.8),
+                'min_samples_split': trial.suggest_int('min_samples_split', 20, 50),
+                'min_samples_leaf': trial.suggest_int('min_samples_leaf', 10, 25),
+                'max_features': trial.suggest_categorical('max_features', ['sqrt', 'log2']),
+                'max_leaf_nodes': trial.suggest_int('max_leaf_nodes', 30, 80),
+                'min_impurity_decrease': trial.suggest_float('min_impurity_decrease', 0.0, 0.01),
+                'ccp_alpha': trial.suggest_float('ccp_alpha', 0.0, 0.01),
+                'validation_fraction': 0.1,
+                'n_iter_no_change': 20,  # Early stopping
+                'random_state': 42
+            }
+            
+            model = GradientBoostingClassifier(**param)
+            model.fit(X_train, y_train)
+            
+            val_acc = model.score(X_val, y_val)
+            return val_acc
+        
+        study = optuna.create_study(
+            direction='maximize',
+            sampler=optuna.samplers.TPESampler(seed=42, n_startup_trials=10),
+            pruner=optuna.pruners.MedianPruner(n_startup_trials=5)
+        )
+        
+        study.optimize(objective, n_trials=30, show_progress_bar=False)
+        
+        best_model = GradientBoostingClassifier(**study.best_params)
+        best_model.fit(X_train, y_train)
+        
+        # 과적합 체크
+        train_acc = best_model.score(X_train, y_train)
+        val_acc = best_model.score(X_val, y_val)
+        print(f"[Gradient Boosting] Train Acc: {train_acc:.4f} | Val Acc: {val_acc:.4f} | Gap: {train_acc - val_acc:.4f}")
+        
+        return best_model
+    
+    
+    @staticmethod
+    def mlp(X_train, y_train, X_val, y_val):
+        """
+        Multi-Layer Perceptron with 강화된 정규화
+        4 레이어는 너무 많음 - 3 레이어로 축소
+        """
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+        
+        def objective(trial):
+            # 보수적인 유닛 수
+            units1 = trial.suggest_int('units1', 48, 128, step=32)
+            units2 = trial.suggest_int('units2', 24, 64, step=16)
+            units3 = trial.suggest_int('units3', 12, 32, step=8)
+            dropout = trial.suggest_float('dropout', 0.4, 0.6)  # 더 높은 dropout
+            l2_reg = trial.suggest_float('l2_reg', 0.02, 0.15, log=True)  # 더 강한 L2
+            learning_rate = trial.suggest_float('learning_rate', 0.0001, 0.002, log=True)
+            
+            input_dim = X_train.shape[1]
+            model = Sequential([
+                Dense(units1, activation='relu', input_dim=input_dim, 
+                     kernel_regularizer=l2(l2_reg)),
+                BatchNormalization(),
+                Dropout(dropout),
+                Dense(units2, activation='relu', kernel_regularizer=l2(l2_reg)),
+                BatchNormalization(),
+                Dropout(dropout),
+                Dense(units3, activation='relu', kernel_regularizer=l2(l2_reg)),
+                Dropout(dropout),
+                Dense(1, activation='sigmoid')
+            ])
+            
+            model.compile(
+                optimizer=tf.keras.optimizers.Adam(
+                    learning_rate=learning_rate,
+                    clipnorm=1.0
+                ),
+                loss='binary_crossentropy',
+                metrics=['accuracy']
+            )
+            
+            early_stop = EarlyStopping(
+                monitor='val_loss',
+                patience=10,
+                restore_best_weights=True,
+                min_delta=1e-4,
+                mode='min'
+            )
+            
+            history = model.fit(
+                X_train, y_train,
+                validation_data=(X_val, y_val),
+                epochs=50,
+                batch_size=64,
+                callbacks=[early_stop],
+                verbose=0
+            )
+            
+            _, val_accuracy = model.evaluate(X_val, y_val, verbose=0)
+            return val_accuracy
+        
+        study = optuna.create_study(
+            direction='maximize',
+            sampler=optuna.samplers.TPESampler(seed=42, n_startup_trials=5),
+            pruner=optuna.pruners.MedianPruner(n_startup_trials=3, n_warmup_steps=5)
+        )
+        
+        study.optimize(objective, n_trials=15, show_progress_bar=False)
+        
+        # 최종 모델
+        best_params = study.best_params
+        input_dim = X_train.shape[1]
+        model = Sequential([
+            Dense(best_params['units1'], activation='relu', input_dim=input_dim, 
+                 kernel_regularizer=l2(best_params['l2_reg'])),
+            BatchNormalization(),
+            Dropout(best_params['dropout']),
+            Dense(best_params['units2'], activation='relu', 
+                 kernel_regularizer=l2(best_params['l2_reg'])),
+            BatchNormalization(),
+            Dropout(best_params['dropout']),
+            Dense(best_params['units3'], activation='relu', 
+                 kernel_regularizer=l2(best_params['l2_reg'])),
+            Dropout(best_params['dropout']),
+            Dense(1, activation='sigmoid')
+        ])
+        
+        model.compile(
+            optimizer=tf.keras.optimizers.Adam(
+                learning_rate=best_params['learning_rate'],
+                clipnorm=1.0
+            ),
+            loss='binary_crossentropy',
+            metrics=['accuracy']
+        )
+        
+        early_stop = EarlyStopping(
+            monitor='val_loss',
+            patience=15,
+            restore_best_weights=True,
+            min_delta=1e-4,
+            mode='min'
+        )
+        
+        reduce_lr = ReduceLROnPlateau(
+            monitor='val_loss',
+            factor=0.5,
+            patience=7,
+            min_lr=1e-7,
+            mode='min',
+            verbose=0
+        )
+        
+        history = model.fit(
+            X_train, y_train,
+            validation_data=(X_val, y_val),
+            epochs=100,
+            batch_size=64,
+            callbacks=[early_stop, reduce_lr],
+            verbose=0
+        )
+        
+        # 과적합 체크
+        train_loss, train_acc = model.evaluate(X_train, y_train, verbose=0)
+        val_loss, val_acc = model.evaluate(X_val, y_val, verbose=0)
+        print(f"[MLP] Train Acc: {train_acc:.4f} | Val Acc: {val_acc:.4f} | Gap: {train_acc - val_acc:.4f}")
+        
+        return model
+    
+    @staticmethod
+    def stacking_ensemble(X_train, y_train, X_val, y_val):
+        """
+        Stacking Ensemble with 강화된 정규화
+        CV와 강한 정규화로 과적합 방지
+        """
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+        
+        def objective(trial):
+            # 보수적인 base learner 설정
+            rf_estimators = trial.suggest_int('rf_estimators', 30, 100)
+            rf_depth = trial.suggest_int('rf_depth', 5, 10)
+            rf_min_samples_split = trial.suggest_int('rf_min_samples_split', 25, 50)
+            
+            xgb_estimators = trial.suggest_int('xgb_estimators', 50, 150)
+            xgb_depth = trial.suggest_int('xgb_depth', 3, 5)
+            xgb_lr = trial.suggest_float('xgb_lr', 0.01, 0.05, log=True)
+            
+            lgbm_estimators = trial.suggest_int('lgbm_estimators', 50, 150)
+            lgbm_depth = trial.suggest_int('lgbm_depth', 3, 5)
+            lgbm_lr = trial.suggest_float('lgbm_lr', 0.01, 0.05, log=True)
+            
+            meta_C = trial.suggest_float('meta_C', 0.01, 1.0, log=True)
+            
+            base_learners = [
+                ('rf', RandomForestClassifier(
+                    n_estimators=rf_estimators,
+                    max_depth=rf_depth,
+                    min_samples_split=rf_min_samples_split,
+                    min_samples_leaf=15,
+                    max_samples=0.7,
+                    max_features='sqrt',
+                    random_state=42,
+                    n_jobs=-1
+                )),
+                ('xgb', XGBClassifier(
+                    n_estimators=xgb_estimators,
+                    max_depth=xgb_depth,
+                    learning_rate=xgb_lr,
+                    subsample=0.7,
+                    colsample_bytree=0.7,
+                    reg_alpha=1.0,
+                    reg_lambda=2.0,
+                    min_child_weight=10,
+                    random_state=42,
+                    n_jobs=-1
+                )),
+                ('lgbm', LGBMClassifier(
+                    n_estimators=lgbm_estimators,
+                    max_depth=lgbm_depth,
+                    learning_rate=lgbm_lr,
+                    subsample=0.7,
+                    colsample_bytree=0.7,
+                    reg_alpha=1.0,
+                    reg_lambda=1.0,
+                    min_child_samples=40,
+                    random_state=42,
+                    verbose=-1,
+                    force_col_wise=True
+                ))
+            ]
+            
+            # 강한 정규화를 가진 meta learner
+            meta_learner = LogisticRegression(
+                max_iter=2000, 
+                C=meta_C, 
+                random_state=42,
+                penalty='l2'
+            )
+            
+            model = StackingClassifier(
+                estimators=base_learners,
+                final_estimator=meta_learner,
+                cv=5,  # CV 증가
+                n_jobs=-1,
+                passthrough=False  # 원본 특성은 전달하지 않음
+            )
+            
+            model.fit(X_train, y_train)
+            val_acc = model.score(X_val, y_val)
+            
+            return val_acc
+        
+        study = optuna.create_study(
+            direction='maximize',
+            sampler=optuna.samplers.TPESampler(seed=42, n_startup_trials=5),
+            pruner=optuna.pruners.MedianPruner(n_startup_trials=3)
+        )
+        
+        study.optimize(objective, n_trials=20, show_progress_bar=False)
+        
+        # 최종 모델
+        best_params = study.best_params
+        base_learners = [
+            ('rf', RandomForestClassifier(
+                n_estimators=best_params['rf_estimators'],
+                max_depth=best_params['rf_depth'],
+                min_samples_split=best_params['rf_min_samples_split'],
+                min_samples_leaf=15,
+                max_samples=0.7,
+                max_features='sqrt',
+                random_state=42,
+                n_jobs=-1
+            )),
+            ('xgb', XGBClassifier(
+                n_estimators=best_params['xgb_estimators'],
+                max_depth=best_params['xgb_depth'],
+                learning_rate=best_params['xgb_lr'],
+                subsample=0.7,
+                colsample_bytree=0.7,
+                reg_alpha=1.0,
+                reg_lambda=2.0,
+                min_child_weight=10,
+                random_state=42,
+                n_jobs=-1
+            )),
+            ('lgbm', LGBMClassifier(
+                n_estimators=best_params['lgbm_estimators'],
+                max_depth=best_params['lgbm_depth'],
+                learning_rate=best_params['lgbm_lr'],
+                subsample=0.7,
+                colsample_bytree=0.7,
+                reg_alpha=1.0,
+                reg_lambda=1.0,
+                min_child_samples=40,
+                random_state=42,
+                verbose=-1,
+                force_col_wise=True
+            ))
+        ]
+        
+        meta_learner = LogisticRegression(
+            max_iter=2000,
+            C=best_params['meta_C'],
+            random_state=42,
+            penalty='l2'
+        )
+        
+        best_model = StackingClassifier(
+            estimators=base_learners,
+            final_estimator=meta_learner,
+            cv=5,
+            n_jobs=-1,
+            passthrough=False
+        )
+        
+        best_model.fit(X_train, y_train)
+        
+        # 과적합 체크
+        train_acc = best_model.score(X_train, y_train)
+        val_acc = best_model.score(X_val, y_val)
+        print(f"[Stacking] Train Acc: {train_acc:.4f} | Val Acc: {val_acc:.4f} | Gap: {train_acc - val_acc:.4f}")
+        
+        return best_model
+    
+    @staticmethod
+    def voting_hard(X_train, y_train, X_val, y_val):
+        """
+        Hard Voting Ensemble with 강화된 정규화
+        GridSearchCV 대신 Optuna 사용
+        """
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+        
+        def objective(trial):
+            rf_n_est = trial.suggest_int('rf_n_estimators', 30, 100)
+            rf_depth = trial.suggest_int('rf_max_depth', 6, 12)
+            xgb_n_est = trial.suggest_int('xgb_n_estimators', 50, 150)
+            xgb_depth = trial.suggest_int('xgb_max_depth', 3, 6)
+            lgbm_n_est = trial.suggest_int('lgbm_n_estimators', 50, 150)
+            
+            estimators = [
+                ('rf', RandomForestClassifier(
+                    n_estimators=rf_n_est,
+                    max_depth=rf_depth,
+                    min_samples_split=25,
+                    min_samples_leaf=12,
+                    max_samples=0.7,
+                    random_state=42,
+                    n_jobs=-1
+                )),
+                ('xgb', XGBClassifier(
+                    n_estimators=xgb_n_est,
+                    max_depth=xgb_depth,
+                    learning_rate=0.03,
+                    subsample=0.7,
+                    colsample_bytree=0.7,
+                    reg_alpha=1.0,
+                    reg_lambda=2.0,
+                    random_state=42,
+                    n_jobs=-1
+                )),
+                ('lgbm', LGBMClassifier(
+                    n_estimators=lgbm_n_est,
+                    max_depth=5,
+                    learning_rate=0.03,
+                    subsample=0.7,
+                    reg_alpha=1.0,
+                    reg_lambda=1.0,
+                    random_state=42,
+                    verbose=-1
+                ))
+            ]
+            
+            model = VotingClassifier(estimators=estimators, voting='hard', n_jobs=-1)
+            model.fit(X_train, y_train)
+            
+            val_acc = model.score(X_val, y_val)
+            return val_acc
+        
+        study = optuna.create_study(
+            direction='maximize',
+            sampler=optuna.samplers.TPESampler(seed=42, n_startup_trials=5)
+        )
+        
+        study.optimize(objective, n_trials=15, show_progress_bar=False)
+        
+        # 최종 모델
+        best_params = study.best_params
+        estimators = [
+            ('rf', RandomForestClassifier(
+                n_estimators=best_params['rf_n_estimators'],
+                max_depth=best_params['rf_max_depth'],
+                min_samples_split=25,
+                min_samples_leaf=12,
+                max_samples=0.7,
+                random_state=42,
+                n_jobs=-1
+            )),
+            ('xgb', XGBClassifier(
+                n_estimators=best_params['xgb_n_estimators'],
+                max_depth=best_params['xgb_max_depth'],
+                learning_rate=0.03,
+                subsample=0.7,
+                colsample_bytree=0.7,
+                reg_alpha=1.0,
+                reg_lambda=2.0,
+                random_state=42,
+                n_jobs=-1
+            )),
+            ('lgbm', LGBMClassifier(
+                n_estimators=best_params['lgbm_n_estimators'],
+                max_depth=5,
+                learning_rate=0.03,
+                subsample=0.7,
+                reg_alpha=1.0,
+                reg_lambda=1.0,
+                random_state=42,
+                verbose=-1
+            ))
+        ]
+        
+        best_model = VotingClassifier(estimators=estimators, voting='hard', n_jobs=-1)
+        best_model.fit(X_train, y_train)
+        
+        # 과적합 체크
+        train_acc = best_model.score(X_train, y_train)
+        val_acc = best_model.score(X_val, y_val)
+        print(f"[Voting Hard] Train Acc: {train_acc:.4f} | Val Acc: {val_acc:.4f} | Gap: {train_acc - val_acc:.4f}")
+        
+        return best_model
+    
+    @staticmethod
+    def voting_soft(X_train, y_train, X_val, y_val):
+        """
+        Soft Voting Ensemble with 강화된 정규화
+        GridSearchCV 대신 Optuna 사용
+        """
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+        
+        def objective(trial):
+            rf_n_est = trial.suggest_int('rf_n_estimators', 30, 100)
+            rf_depth = trial.suggest_int('rf_max_depth', 6, 12)
+            xgb_n_est = trial.suggest_int('xgb_n_estimators', 50, 150)
+            xgb_depth = trial.suggest_int('xgb_max_depth', 3, 6)
+            
+            estimators = [
+                ('rf', RandomForestClassifier(
+                    n_estimators=rf_n_est,
+                    max_depth=rf_depth,
+                    min_samples_split=25,
+                    min_samples_leaf=12,
+                    max_samples=0.7,
+                    random_state=42,
+                    n_jobs=-1
+                )),
+                ('xgb', XGBClassifier(
+                    n_estimators=xgb_n_est,
+                    max_depth=xgb_depth,
+                    learning_rate=0.03,
+                    subsample=0.7,
+                    colsample_bytree=0.7,
+                    reg_alpha=1.0,
+                    reg_lambda=2.0,
+                    random_state=42,
+                    n_jobs=-1
+                )),
+                ('lgbm', LGBMClassifier(
+                    n_estimators=100,
+                    max_depth=5,
+                    learning_rate=0.03,
+                    subsample=0.7,
+                    reg_alpha=1.0,
+                    random_state=42,
+                    verbose=-1
+                )),
+                ('lr', LogisticRegression(
+                    max_iter=2000, 
+                    C=0.1, 
+                    random_state=42
+                ))
+            ]
+            
+            model = VotingClassifier(estimators=estimators, voting='soft', n_jobs=-1)
+            model.fit(X_train, y_train)
+            
+            val_acc = model.score(X_val, y_val)
+            return val_acc
+        
+        study = optuna.create_study(
+            direction='maximize',
+            sampler=optuna.samplers.TPESampler(seed=42, n_startup_trials=5)
+        )
+        
+        study.optimize(objective, n_trials=15, show_progress_bar=False)
+        
+        # 최종 모델
+        best_params = study.best_params
+        estimators = [
+            ('rf', RandomForestClassifier(
+                n_estimators=best_params['rf_n_estimators'],
+                max_depth=best_params['rf_max_depth'],
+                min_samples_split=25,
+                min_samples_leaf=12,
+                max_samples=0.7,
+                random_state=42,
+                n_jobs=-1
+            )),
+            ('xgb', XGBClassifier(
+                n_estimators=best_params['xgb_n_estimators'],
+                max_depth=best_params['xgb_max_depth'],
+                learning_rate=0.03,
+                subsample=0.7,
+                colsample_bytree=0.7,
+                reg_alpha=1.0,
+                reg_lambda=2.0,
+                random_state=42,
+                n_jobs=-1
+            )),
+            ('lgbm', LGBMClassifier(
+                n_estimators=100,
+                max_depth=5,
+                learning_rate=0.03,
+                subsample=0.7,
+                reg_alpha=1.0,
+                random_state=42,
+                verbose=-1
+            )),
+            ('lr', LogisticRegression(max_iter=2000, C=0.1, random_state=42))
+        ]
+        
+        best_model = VotingClassifier(estimators=estimators, voting='soft', n_jobs=-1)
+        best_model.fit(X_train, y_train)
+        
+        # 과적합 체크
+        train_acc = best_model.score(X_train, y_train)
+        val_acc = best_model.score(X_val, y_val)
+        print(f"[Voting Soft] Train Acc: {train_acc:.4f} | Val Acc: {val_acc:.4f} | Gap: {train_acc - val_acc:.4f}")
+        
+        return best_model
+    
+    @staticmethod
+    def lstm(X_train, y_train, X_val, y_val, input_shape):
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+        def objective(trial):
+            units1 = trial.suggest_int('units1', 32, 80, step=16)
+            units2 = trial.suggest_int('units2', 16, 48, step=16)
+            dropout = trial.suggest_float('dropout', 0.35, 0.55)
+            l2_reg = trial.suggest_float('l2_reg', 0.01, 0.15, log=True)
+            learning_rate = trial.suggest_float('learning_rate', 0.0001, 0.002, log=True)
+
+            X_aug = TimeSeriesAugmentation.jittering(X_train, sigma=0.015)
+
+            model = Sequential([
+                LSTM(
+                    units1,
+                    activation='tanh',
+                    recurrent_activation='sigmoid',
+                    return_sequences=True,
+                    input_shape=input_shape,
+                    kernel_regularizer=l2(l2_reg),
+                    recurrent_regularizer=l2(l2_reg * 0.5),
+                    dropout=dropout,
+                    recurrent_dropout=0.0
+                ),
+                BatchNormalization(),
+                LSTM(
+                    units2,
+                    activation='tanh',
+                    recurrent_activation='sigmoid',
+                    kernel_regularizer=l2(l2_reg),
+                    recurrent_regularizer=l2(l2_reg * 0.5),
+                    dropout=dropout,
+                    recurrent_dropout=0.0
+                ),
+                BatchNormalization(),
+                Dense(16, activation='relu', kernel_regularizer=l2(l2_reg)),
+                Dropout(dropout),
+                Dense(1, activation='sigmoid')
+            ])
+
+            model.compile(
+                optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate, clipnorm=1.0),
+                loss='binary_crossentropy',
+                metrics=['accuracy']
+            )
+
+            early_stop = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True, min_delta=1e-4, mode='min')
+
+            history = model.fit(X_aug, y_train, validation_data=(X_val, y_val), epochs=50, batch_size=32, callbacks=[early_stop], verbose=0)
+
+            _, val_accuracy = model.evaluate(X_val, y_val, verbose=0)
+            return val_accuracy
+
+        study = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler(seed=42, n_startup_trials=5), pruner=optuna.pruners.MedianPruner(n_startup_trials=3, n_warmup_steps=5))
+        study.optimize(objective, n_trials=15, show_progress_bar=False)
+
+        best_params = study.best_params
+        X_aug = TimeSeriesAugmentation.jittering(X_train, sigma=0.015)
+
+        model = Sequential([
+            LSTM(best_params['units1'], activation='tanh', recurrent_activation='sigmoid', return_sequences=True, input_shape=input_shape, kernel_regularizer=l2(best_params['l2_reg']), recurrent_regularizer=l2(best_params['l2_reg'] * 0.5), dropout=best_params['dropout'], recurrent_dropout=0.0),
+            BatchNormalization(),
+            LSTM(best_params['units2'], activation='tanh', recurrent_activation='sigmoid', kernel_regularizer=l2(best_params['l2_reg']), recurrent_regularizer=l2(best_params['l2_reg'] * 0.5), dropout=best_params['dropout'], recurrent_dropout=0.0),
+            BatchNormalization(),
+            Dense(16, activation='relu', kernel_regularizer=l2(best_params['l2_reg'])),
+            Dropout(best_params['dropout']),
+            Dense(1, activation='sigmoid')
+        ])
+
+        model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=best_params['learning_rate'], clipnorm=1.0), loss='binary_crossentropy', metrics=['accuracy'])
+
+        early_stop = EarlyStopping(monitor='val_loss', patience=15, restore_best_weights=True, min_delta=1e-4, mode='min')
+        reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=7, min_lr=1e-7, mode='min', verbose=0)
+
+        model.fit(X_aug, y_train, validation_data=(X_val, y_val), epochs=100, batch_size=32, callbacks=[early_stop, reduce_lr], verbose=0)
+
+        train_loss, train_acc = model.evaluate(X_train, y_train, verbose=0)
+        val_loss, val_acc = model.evaluate(X_val, y_val, verbose=0)
+        print(f"[LSTM] Train Acc: {train_acc:.4f} | Val Acc: {val_acc:.4f} | Gap: {train_acc - val_acc:.4f}")
+        print(f"[LSTM] Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Gap: {val_loss - train_loss:.4f}")
+
+        return model
+
+
+    @staticmethod
+    def bilstm(X_train, y_train, X_val, y_val, input_shape):
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+        def objective(trial):
+            units1 = trial.suggest_int('units1', 24, 64, step=16)
+            units2 = trial.suggest_int('units2', 12, 40, step=12)
+            dropout = trial.suggest_float('dropout', 0.4, 0.6)
+            l2_reg = trial.suggest_float('l2_reg', 0.02, 0.2, log=True)
+            learning_rate = trial.suggest_float('learning_rate', 0.0001, 0.002, log=True)
+
+            X_aug = TimeSeriesAugmentation.jittering(X_train, sigma=0.015)
+
+            model = Sequential([
+                Bidirectional(LSTM(units1, activation='tanh', recurrent_activation='sigmoid', return_sequences=True, kernel_regularizer=l2(l2_reg), recurrent_regularizer=l2(l2_reg * 0.5), dropout=dropout, recurrent_dropout=0.0), input_shape=input_shape),
+                BatchNormalization(),
+                Bidirectional(LSTM(units2, activation='tanh', recurrent_activation='sigmoid', kernel_regularizer=l2(l2_reg), recurrent_regularizer=l2(l2_reg * 0.5), dropout=dropout, recurrent_dropout=0.0)),
+                BatchNormalization(),
+                Dense(12, activation='relu', kernel_regularizer=l2(l2_reg)),
+                Dropout(dropout),
+                Dense(1, activation='sigmoid')
+            ])
+
+            model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate, clipnorm=1.0), loss='binary_crossentropy', metrics=['accuracy'])
+
+            early_stop = EarlyStopping(monitor='val_loss', patience=12, restore_best_weights=True, min_delta=1e-4, mode='min')
+
+            history = model.fit(X_aug, y_train, validation_data=(X_val, y_val), epochs=50, batch_size=32, callbacks=[early_stop], verbose=0)
+
+            _, val_accuracy = model.evaluate(X_val, y_val, verbose=0)
+            return val_accuracy
+
+        study = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler(seed=42, n_startup_trials=5), pruner=optuna.pruners.MedianPruner(n_startup_trials=3, n_warmup_steps=5))
+        study.optimize(objective, n_trials=12, show_progress_bar=False)
+
+        best_params = study.best_params
+        X_aug = TimeSeriesAugmentation.jittering(X_train, sigma=0.015)
+
+        model = Sequential([
+            Bidirectional(LSTM(best_params['units1'], activation='tanh', recurrent_activation='sigmoid', return_sequences=True, kernel_regularizer=l2(best_params['l2_reg']), recurrent_regularizer=l2(best_params['l2_reg'] * 0.5), dropout=best_params['dropout'], recurrent_dropout=0.0), input_shape=input_shape),
+            BatchNormalization(),
+            Bidirectional(LSTM(best_params['units2'], activation='tanh', recurrent_activation='sigmoid', kernel_regularizer=l2(best_params['l2_reg']), recurrent_regularizer=l2(best_params['l2_reg'] * 0.5), dropout=best_params['dropout'], recurrent_dropout=0.0)),
+            BatchNormalization(),
+            Dense(12, activation='relu', kernel_regularizer=l2(best_params['l2_reg'])),
+            Dropout(best_params['dropout']),
+            Dense(1, activation='sigmoid')
+        ])
+
+        model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=best_params['learning_rate'], clipnorm=1.0), loss='binary_crossentropy', metrics=['accuracy'])
+
+        early_stop = EarlyStopping(monitor='val_loss', patience=18, restore_best_weights=True, min_delta=1e-4, mode='min')
+        reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=8, min_lr=1e-7, mode='min', verbose=0)
+
+        model.fit(X_aug, y_train, validation_data=(X_val, y_val), epochs=100, batch_size=32, callbacks=[early_stop, reduce_lr], verbose=0)
+
+        train_loss, train_acc = model.evaluate(X_train, y_train, verbose=0)
+        val_loss, val_acc = model.evaluate(X_val, y_val, verbose=0)
+        print(f"[BiLSTM] Train Acc: {train_acc:.4f} | Val Acc: {val_acc:.4f} | Gap: {train_acc - val_acc:.4f}")
+        print(f"[BiLSTM] Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Gap: {val_loss - train_loss:.4f}")
+
+        return model
+
+
+    @staticmethod
+    def gru(X_train, y_train, X_val, y_val, input_shape):
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+        def objective(trial):
+            units1 = trial.suggest_int('units1', 32, 96, step=16)
+            units2 = trial.suggest_int('units2', 16, 56, step=16)
+            dropout = trial.suggest_float('dropout', 0.35, 0.55)
+            l2_reg = trial.suggest_float('l2_reg', 0.01, 0.15, log=True)
+            learning_rate = trial.suggest_float('learning_rate', 0.0001, 0.002, log=True)
+
+            X_aug = TimeSeriesAugmentation.jittering(X_train, sigma=0.015)
+
+            model = Sequential([
+                GRU(units1, activation='tanh', recurrent_activation='sigmoid', return_sequences=True, input_shape=input_shape, kernel_regularizer=l2(l2_reg), recurrent_regularizer=l2(l2_reg * 0.5), dropout=dropout, recurrent_dropout=0.0),
+                BatchNormalization(),
+                GRU(units2, activation='tanh', recurrent_activation='sigmoid', kernel_regularizer=l2(l2_reg), recurrent_regularizer=l2(l2_reg * 0.5), dropout=dropout, recurrent_dropout=0.0),
+                BatchNormalization(),
+                Dense(16, activation='relu', kernel_regularizer=l2(l2_reg)),
+                Dropout(dropout),
+                Dense(1, activation='sigmoid')
+            ])
+
+            model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate, clipnorm=1.0), loss='binary_crossentropy', metrics=['accuracy'])
+
+            early_stop = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True, min_delta=1e-4, mode='min')
+
+            history = model.fit(X_aug, y_train, validation_data=(X_val, y_val), epochs=50, batch_size=32, callbacks=[early_stop], verbose=0)
+
+            _, val_accuracy = model.evaluate(X_val, y_val, verbose=0)
+            return val_accuracy
+
+        study = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler(seed=42, n_startup_trials=5), pruner=optuna.pruners.MedianPruner(n_startup_trials=3, n_warmup_steps=5))
+        study.optimize(objective, n_trials=15, show_progress_bar=False)
+
+        best_params = study.best_params
+        X_aug = TimeSeriesAugmentation.jittering(X_train, sigma=0.015)
+
+        model = Sequential([
+            GRU(best_params['units1'], activation='tanh', recurrent_activation='sigmoid', return_sequences=True, input_shape=input_shape, kernel_regularizer=l2(best_params['l2_reg']), recurrent_regularizer=l2(best_params['l2_reg'] * 0.5), dropout=best_params['dropout'], recurrent_dropout=0.0),
+            BatchNormalization(),
+            GRU(best_params['units2'], activation='tanh', recurrent_activation='sigmoid', kernel_regularizer=l2(best_params['l2_reg']), recurrent_regularizer=l2(best_params['l2_reg'] * 0.5), dropout=best_params['dropout'], recurrent_dropout=0.0),
+            BatchNormalization(),
+            Dense(16, activation='relu', kernel_regularizer=l2(best_params['l2_reg'])),
+            Dropout(best_params['dropout']),
+            Dense(1, activation='sigmoid')
+        ])
+
+        model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=best_params['learning_rate'], clipnorm=1.0), loss='binary_crossentropy', metrics=['accuracy'])
+
+        early_stop = EarlyStopping(monitor='val_loss', patience=15, restore_best_weights=True, min_delta=1e-4, mode='min')
+        reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=7, min_lr=1e-7, mode='min', verbose=0)
+
+        model.fit(X_aug, y_train, validation_data=(X_val, y_val), epochs=100, batch_size=32, callbacks=[early_stop, reduce_lr], verbose=0)
+
+        train_loss, train_acc = model.evaluate(X_train, y_train, verbose=0)
+        val_loss, val_acc = model.evaluate(X_val, y_val, verbose=0)
+        print(f"[GRU] Train Acc: {train_acc:.4f} | Val Acc: {val_acc:.4f} | Gap: {train_acc - val_acc:.4f}")
+        print(f"[GRU] Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Gap: {val_loss - train_loss:.4f}")
+
+        return model
+
+
+    @staticmethod
+    def stacked_lstm(X_train, y_train, X_val, y_val, input_shape):
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+        def objective(trial):
+            units1 = trial.suggest_int('units1', 32, 72, step=16)
+            units2 = trial.suggest_int('units2', 24, 48, step=12)
+            units3 = trial.suggest_int('units3', 12, 32, step=8)
+            dropout = trial.suggest_float('dropout', 0.4, 0.6)
+            l2_reg = trial.suggest_float('l2_reg', 0.02, 0.2, log=True)
+            learning_rate = trial.suggest_float('learning_rate', 0.00005, 0.001, log=True)
+
+            X_aug = TimeSeriesAugmentation.jittering(X_train, sigma=0.015)
+
+            model = Sequential([
+                LSTM(units1, activation='tanh', recurrent_activation='sigmoid', return_sequences=True, input_shape=input_shape, kernel_regularizer=l2(l2_reg), recurrent_regularizer=l2(l2_reg * 0.5), dropout=dropout, recurrent_dropout=0.0),
+                BatchNormalization(),
+                LSTM(units2, activation='tanh', recurrent_activation='sigmoid', return_sequences=True, kernel_regularizer=l2(l2_reg), recurrent_regularizer=l2(l2_reg * 0.5), dropout=dropout, recurrent_dropout=0.0),
+                BatchNormalization(),
+                LSTM(units3, activation='tanh', recurrent_activation='sigmoid', kernel_regularizer=l2(l2_reg), recurrent_regularizer=l2(l2_reg * 0.5), dropout=dropout, recurrent_dropout=0.0),
+                BatchNormalization(),
+                Dense(12, activation='relu', kernel_regularizer=l2(l2_reg)),
+                Dropout(dropout),
+                Dense(1, activation='sigmoid')
+            ])
+
+            model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate, clipnorm=0.5), loss='binary_crossentropy', metrics=['accuracy'])
+
+            early_stop = EarlyStopping(monitor='val_loss', patience=12, restore_best_weights=True, min_delta=1e-4, mode='min')
+
+            history = model.fit(X_aug, y_train, validation_data=(X_val, y_val), epochs=50, batch_size=32, callbacks=[early_stop], verbose=0)
+
+            _, val_accuracy = model.evaluate(X_val, y_val, verbose=0)
+            return val_accuracy
+
+        study = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler(seed=42, n_startup_trials=5), pruner=optuna.pruners.MedianPruner(n_startup_trials=3, n_warmup_steps=5))
+        study.optimize(objective, n_trials=12, show_progress_bar=False)
+
+        best_params = study.best_params
+        X_aug = TimeSeriesAugmentation.jittering(X_train, sigma=0.015)
+
+        model = Sequential([
+            LSTM(best_params['units1'], activation='tanh', recurrent_activation='sigmoid', return_sequences=True, input_shape=input_shape, kernel_regularizer=l2(best_params['l2_reg']), recurrent_regularizer=l2(best_params['l2_reg'] * 0.5), dropout=best_params['dropout'], recurrent_dropout=0.0),
+            BatchNormalization(),
+            LSTM(best_params['units2'], activation='tanh', recurrent_activation='sigmoid', return_sequences=True, kernel_regularizer=l2(best_params['l2_reg']), recurrent_regularizer=l2(best_params['l2_reg'] * 0.5), dropout=best_params['dropout'], recurrent_dropout=0.0),
+            BatchNormalization(),
+            LSTM(best_params['units3'], activation='tanh', recurrent_activation='sigmoid', kernel_regularizer=l2(best_params['l2_reg']), recurrent_regularizer=l2(best_params['l2_reg'] * 0.5), dropout=best_params['dropout'], recurrent_dropout=0.0),
+            BatchNormalization(),
+            Dense(12, activation='relu', kernel_regularizer=l2(best_params['l2_reg'])),
+            Dropout(best_params['dropout']),
+            Dense(1, activation='sigmoid')
+        ])
+
+        model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=best_params['learning_rate'], clipnorm=0.5), loss='binary_crossentropy', metrics=['accuracy'])
+
+        early_stop = EarlyStopping(monitor='val_loss', patience=20, restore_best_weights=True, min_delta=1e-4, mode='min')
+        reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=9, min_lr=1e-8, mode='min', verbose=0)
+
+        model.fit(X_aug, y_train, validation_data=(X_val, y_val), epochs=120, batch_size=32, callbacks=[early_stop, reduce_lr], verbose=0)
+
+        train_loss, train_acc = model.evaluate(X_train, y_train, verbose=0)
+        val_loss, val_acc = model.evaluate(X_val, y_val, verbose=0)
+        print(f"[Stacked LSTM] Train Acc: {train_acc:.4f} | Val Acc: {val_acc:.4f} | Gap: {train_acc - val_acc:.4f}")
+        print(f"[Stacked LSTM] Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Gap: {val_loss - train_loss:.4f}")
+
+        return model
+    
+    
+    @staticmethod
+    def vmd_hybrid(X_train, y_train, X_val, y_val, input_shape):
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+        def objective(trial):
+            n_filters = trial.suggest_int('n_filters', 16, 32, step=8)
+            num_heads = trial.suggest_int('num_heads', 2, 4)
+            key_dim = trial.suggest_int('key_dim', 16, 32, step=8)
+            ff_dim = trial.suggest_int('ff_dim', 48, 96, step=24)
+            dropout_rate = trial.suggest_float('dropout_rate', 0.3, 0.5)
+            l2_reg = trial.suggest_float('l2_reg', 0.02, 0.1, log=True)
+            learning_rate = trial.suggest_float('learning_rate', 0.0001, 0.001, log=True)
+
+            X_aug = TimeSeriesAugmentation.jittering(X_train, sigma=0.015)
+
+            inputs = Input(shape=input_shape)
+            x = Conv1D(n_filters, 1, padding='same', kernel_regularizer=l2(l2_reg))(inputs)
+            x = BatchNormalization()(x)
+
+            low_freq = AveragePooling1D(pool_size=5, strides=1, padding='same')(x)
+            low_freq = Conv1D(n_filters, 3, activation='relu', padding='same', kernel_regularizer=l2(l2_reg))(low_freq)
+
+            mid_freq = x - low_freq
+            mid_freq = Conv1D(n_filters, 3, activation='relu', padding='same', kernel_regularizer=l2(l2_reg))(mid_freq)
+
+            high_freq = x - low_freq - mid_freq
+            high_freq = Conv1D(n_filters, 3, activation='relu', padding='same', kernel_regularizer=l2(l2_reg))(high_freq)
+
+            x = Concatenate()([low_freq, mid_freq, high_freq])
+            x = BatchNormalization()(x)
+            x = Dropout(dropout_rate)(x)
+
+            attn = MultiHeadAttention(num_heads=num_heads, key_dim=key_dim, dropout=dropout_rate, kernel_regularizer=l2(l2_reg))(x, x)
+            attn = Dropout(dropout_rate)(attn)
+            x = LayerNormalization(epsilon=1e-6)(x + attn)
+
+            ff = Dense(ff_dim, activation='gelu', kernel_regularizer=l2(l2_reg))(x)
+            ff = Dropout(dropout_rate)(ff)
+            ff = Dense(n_filters * 3, kernel_regularizer=l2(l2_reg))(ff)
+            ff = Dropout(dropout_rate)(ff)
+            x = LayerNormalization(epsilon=1e-6)(x + ff)
+
+            x = GlobalAveragePooling1D()(x)
+            x = Dense(24, activation='relu', kernel_regularizer=l2(l2_reg))(x)
+            x = BatchNormalization()(x)
+            x = Dropout(dropout_rate)(x)
+            outputs = Dense(1, activation='sigmoid')(x)
+
+            model = Model(inputs=inputs, outputs=outputs)
+            model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate, clipnorm=1.0), loss='binary_crossentropy', metrics=['accuracy'])
+
+            early_stop = EarlyStopping(monitor='val_loss', patience=12, restore_best_weights=True, min_delta=1e-4, mode='min')
+
+            history = model.fit(X_aug, y_train, validation_data=(X_val, y_val), epochs=50, batch_size=32, callbacks=[early_stop], verbose=0)
+
+            _, val_accuracy = model.evaluate(X_val, y_val, verbose=0)
+            return val_accuracy
+
+        study = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler(seed=42, n_startup_trials=5), pruner=optuna.pruners.MedianPruner(n_startup_trials=3, n_warmup_steps=5))
+        study.optimize(objective, n_trials=10, show_progress_bar=False)
+
+        best_params = study.best_params
+        X_aug = TimeSeriesAugmentation.jittering(X_train, sigma=0.015)
+
+        inputs = Input(shape=input_shape)
+        x = Conv1D(best_params['n_filters'], 1, padding='same', kernel_regularizer=l2(best_params['l2_reg']))(inputs)
+        x = BatchNormalization()(x)
+
+        low_freq = AveragePooling1D(pool_size=5, strides=1, padding='same')(x)
+        low_freq = Conv1D(best_params['n_filters'], 3, activation='relu', padding='same', kernel_regularizer=l2(best_params['l2_reg']))(low_freq)
+
+        mid_freq = x - low_freq
+        mid_freq = Conv1D(best_params['n_filters'], 3, activation='relu', padding='same', kernel_regularizer=l2(best_params['l2_reg']))(mid_freq)
+
+        high_freq = x - low_freq - mid_freq
+        high_freq = Conv1D(best_params['n_filters'], 3, activation='relu', padding='same', kernel_regularizer=l2(best_params['l2_reg']))(high_freq)
+
+        x = Concatenate()([low_freq, mid_freq, high_freq])
+        x = BatchNormalization()(x)
+        x = Dropout(best_params['dropout_rate'])(x)
+
+        attn = MultiHeadAttention(num_heads=best_params['num_heads'], key_dim=best_params['key_dim'], dropout=best_params['dropout_rate'], kernel_regularizer=l2(best_params['l2_reg']))(x, x)
+        attn = Dropout(best_params['dropout_rate'])(attn)
+        x = LayerNormalization(epsilon=1e-6)(x + attn)
+
+        ff = Dense(best_params['ff_dim'], activation='gelu', kernel_regularizer=l2(best_params['l2_reg']))(x)
+        ff = Dropout(best_params['dropout_rate'])(ff)
+        ff = Dense(best_params['n_filters'] * 3, kernel_regularizer=l2(best_params['l2_reg']))(ff)
+        ff = Dropout(best_params['dropout_rate'])(ff)
+        x = LayerNormalization(epsilon=1e-6)(x + ff)
+
+        x = GlobalAveragePooling1D()(x)
+        x = Dense(24, activation='relu', kernel_regularizer=l2(best_params['l2_reg']))(x)
+        x = BatchNormalization()(x)
+        x = Dropout(best_params['dropout_rate'])(x)
+        outputs = Dense(1, activation='sigmoid')(x)
+
+        model = Model(inputs=inputs, outputs=outputs)
+        model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=best_params['learning_rate'], clipnorm=1.0), loss='binary_crossentropy', metrics=['accuracy'])
+
+        early_stop = EarlyStopping(monitor='val_loss', patience=18, restore_best_weights=True, min_delta=1e-4, mode='min')
+        reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=8, min_lr=1e-7, mode='min', verbose=0)
+
+        model.fit(X_aug, y_train, validation_data=(X_val, y_val), epochs=100, batch_size=32, callbacks=[early_stop, reduce_lr], verbose=0)
+
+        train_loss, train_acc = model.evaluate(X_train, y_train, verbose=0)
+        val_loss, val_acc = model.evaluate(X_val, y_val, verbose=0)
+        print(f"[VMD-Hybrid] Train Acc: {train_acc:.4f} | Val Acc: {val_acc:.4f} | Gap: {train_acc - val_acc:.4f}")
+        print(f"[VMD-Hybrid] Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Gap: {val_loss - train_loss:.4f}")
+
+        return model
+    
+    
+    
+    @staticmethod
+    def dtw_lstm(X_train, y_train, X_val, y_val, input_shape):
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+        def objective(trial):
+            units1 = trial.suggest_int('units1', 48, 80, step=16)
+            units2 = trial.suggest_int('units2', 32, 56, step=12)
+            units3 = trial.suggest_int('units3', 16, 40, step=12)
+            dropout = trial.suggest_float('dropout', 0.4, 0.6)
+            l2_reg = trial.suggest_float('l2_reg', 0.02, 0.2, log=True)
+            learning_rate = trial.suggest_float('learning_rate', 0.0001, 0.001, log=True)
+
+            X_aug = TimeSeriesAugmentation.jittering(X_train, sigma=0.015)
+
+            model = Sequential([
+                LSTM(units1, activation='tanh', recurrent_activation='sigmoid', return_sequences=True, input_shape=input_shape, kernel_regularizer=l2(l2_reg), recurrent_regularizer=l2(l2_reg * 0.5), dropout=dropout, recurrent_dropout=0.0),
+                BatchNormalization(),
+                LSTM(units2, activation='tanh', recurrent_activation='sigmoid', return_sequences=True, kernel_regularizer=l2(l2_reg), recurrent_regularizer=l2(l2_reg * 0.5), dropout=dropout, recurrent_dropout=0.0),
+                BatchNormalization(),
+                LSTM(units3, activation='tanh', recurrent_activation='sigmoid', kernel_regularizer=l2(l2_reg), recurrent_regularizer=l2(l2_reg * 0.5), dropout=dropout, recurrent_dropout=0.0),
+                BatchNormalization(),
+                Dropout(dropout),
+                Dense(12, activation='relu', kernel_regularizer=l2(l2_reg)),
+                Dropout(dropout),
+                Dense(1, activation='sigmoid')
+            ])
+
+            model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate, clipnorm=1.0), loss='binary_crossentropy', metrics=['accuracy'])
+            early_stop = EarlyStopping(monitor='val_loss', patience=12, restore_best_weights=True, min_delta=1e-4, mode='min')
+            history = model.fit(X_aug, y_train, validation_data=(X_val, y_val), epochs=50, batch_size=32, callbacks=[early_stop], verbose=0)
+
+            _, val_accuracy = model.evaluate(X_val, y_val, verbose=0)
+            return val_accuracy
+
+        study = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler(seed=42, n_startup_trials=5), pruner=optuna.pruners.MedianPruner(n_startup_trials=3, n_warmup_steps=5))
+        study.optimize(objective, n_trials=12, show_progress_bar=False)
+
+        best_params = study.best_params
+        X_aug = TimeSeriesAugmentation.jittering(X_train, sigma=0.015)
+
+        model = Sequential([
+            LSTM(best_params['units1'], activation='tanh', recurrent_activation='sigmoid', return_sequences=True, input_shape=input_shape, kernel_regularizer=l2(best_params['l2_reg']), recurrent_regularizer=l2(best_params['l2_reg'] * 0.5), dropout=best_params['dropout'], recurrent_dropout=0.0),
+            BatchNormalization(),
+            LSTM(best_params['units2'], activation='tanh', recurrent_activation='sigmoid', return_sequences=True, kernel_regularizer=l2(best_params['l2_reg']), recurrent_regularizer=l2(best_params['l2_reg'] * 0.5), dropout=best_params['dropout'], recurrent_dropout=0.0),
+            BatchNormalization(),
+            LSTM(best_params['units3'], activation='tanh', recurrent_activation='sigmoid', kernel_regularizer=l2(best_params['l2_reg']), recurrent_regularizer=l2(best_params['l2_reg'] * 0.5), dropout=best_params['dropout'], recurrent_dropout=0.0),
+            BatchNormalization(),
+            Dropout(best_params['dropout']),
+            Dense(12, activation='relu', kernel_regularizer=l2(best_params['l2_reg'])),
+            Dropout(best_params['dropout']),
+            Dense(1, activation='sigmoid')
+        ])
+
+        model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=best_params['learning_rate'], clipnorm=1.0), loss='binary_crossentropy', metrics=['accuracy'])
+        early_stop = EarlyStopping(monitor='val_loss', patience=18, restore_best_weights=True, min_delta=1e-4, mode='min')
+        reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=8, min_lr=1e-7, mode='min', verbose=0)
+
+        model.fit(X_aug, y_train, validation_data=(X_val, y_val), epochs=100, batch_size=32, callbacks=[early_stop, reduce_lr], verbose=0)
+
+        train_loss, train_acc = model.evaluate(X_train, y_train, verbose=0)
+        val_loss, val_acc = model.evaluate(X_val, y_val, verbose=0)
+        print(f"[DTW-LSTM] Train Acc: {train_acc:.4f} | Val Acc: {val_acc:.4f} | Gap: {train_acc - val_acc:.4f}")
+
+        return model
+
+
+    @staticmethod
+    def emd_lstm(X_train, y_train, X_val, y_val, input_shape):
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+        def objective(trial):
+            freq_units = trial.suggest_int('freq_units', 24, 48, step=12)
+            units1 = trial.suggest_int('units1', 32, 64, step=16)
+            units2 = trial.suggest_int('units2', 16, 40, step=12)
+            dropout = trial.suggest_float('dropout', 0.4, 0.6)
+            l2_reg = trial.suggest_float('l2_reg', 0.02, 0.2, log=True)
+            learning_rate = trial.suggest_float('learning_rate', 0.0001, 0.001, log=True)
+
+            X_aug = TimeSeriesAugmentation.jittering(X_train, sigma=0.015)
+
+            inputs = Input(shape=input_shape)
+
+            low_freq = AveragePooling1D(pool_size=5, strides=1, padding='same')(inputs)
+            low_freq = LSTM(freq_units, activation='tanh', recurrent_activation='sigmoid', return_sequences=True, kernel_regularizer=l2(l2_reg), recurrent_regularizer=l2(l2_reg * 0.5), dropout=dropout, recurrent_dropout=0.0)(low_freq)
+
+            high_freq = inputs - AveragePooling1D(pool_size=5, strides=1, padding='same')(inputs)
+            high_freq = LSTM(freq_units, activation='tanh', recurrent_activation='sigmoid', return_sequences=True, kernel_regularizer=l2(l2_reg), recurrent_regularizer=l2(l2_reg * 0.5), dropout=dropout, recurrent_dropout=0.0)(high_freq)
+
+            x = Concatenate()([low_freq, high_freq])
+            x = BatchNormalization()(x)
+            x = Dropout(dropout)(x)
+
+            x = LSTM(units1, activation='tanh', recurrent_activation='sigmoid', return_sequences=True, kernel_regularizer=l2(l2_reg), recurrent_regularizer=l2(l2_reg * 0.5), dropout=dropout, recurrent_dropout=0.0)(x)
+            x = BatchNormalization()(x)
+
+            x = LSTM(units2, activation='tanh', recurrent_activation='sigmoid', kernel_regularizer=l2(l2_reg), recurrent_regularizer=l2(l2_reg * 0.5), dropout=dropout, recurrent_dropout=0.0)(x)
+            x = BatchNormalization()(x)
+            x = Dropout(dropout)(x)
+
+            x = Dense(12, activation='relu', kernel_regularizer=l2(l2_reg))(x)
+            x = Dropout(dropout)(x)
+            outputs = Dense(1, activation='sigmoid')(x)
+
+            model = Model(inputs=inputs, outputs=outputs)
+            model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate, clipnorm=1.0), loss='binary_crossentropy', metrics=['accuracy'])
+            early_stop = EarlyStopping(monitor='val_loss', patience=12, restore_best_weights=True, min_delta=1e-4, mode='min')
+            history = model.fit(X_aug, y_train, validation_data=(X_val, y_val), epochs=50, batch_size=32, callbacks=[early_stop], verbose=0)
+
+            _, val_accuracy = model.evaluate(X_val, y_val, verbose=0)
+            return val_accuracy
+
+        study = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler(seed=42, n_startup_trials=5), pruner=optuna.pruners.MedianPruner(n_startup_trials=3))
+        study.optimize(objective, n_trials=10, show_progress_bar=False)
+
+        best_params = study.best_params
+        X_aug = TimeSeriesAugmentation.jittering(X_train, sigma=0.015)
+
+        inputs = Input(shape=input_shape)
+
+        low_freq = AveragePooling1D(pool_size=5, strides=1, padding='same')(inputs)
+        low_freq = LSTM(best_params['freq_units'], activation='tanh', recurrent_activation='sigmoid', return_sequences=True, kernel_regularizer=l2(best_params['l2_reg']), recurrent_regularizer=l2(best_params['l2_reg'] * 0.5), dropout=best_params['dropout'], recurrent_dropout=0.0)(low_freq)
+
+        high_freq = inputs - AveragePooling1D(pool_size=5, strides=1, padding='same')(inputs)
+        high_freq = LSTM(best_params['freq_units'], activation='tanh', recurrent_activation='sigmoid', return_sequences=True, kernel_regularizer=l2(best_params['l2_reg']), recurrent_regularizer=l2(best_params['l2_reg'] * 0.5), dropout=best_params['dropout'], recurrent_dropout=0.0)(high_freq)
+
+        x = Concatenate()([low_freq, high_freq])
+        x = BatchNormalization()(x)
+        x = Dropout(best_params['dropout'])(x)
+
+        x = LSTM(best_params['units1'], activation='tanh', recurrent_activation='sigmoid', return_sequences=True, kernel_regularizer=l2(best_params['l2_reg']), recurrent_regularizer=l2(best_params['l2_reg'] * 0.5), dropout=best_params['dropout'], recurrent_dropout=0.0)(x)
+        x = BatchNormalization()(x)
+
+        x = LSTM(best_params['units2'], activation='tanh', recurrent_activation='sigmoid', kernel_regularizer=l2(best_params['l2_reg']), recurrent_regularizer=l2(best_params['l2_reg'] * 0.5), dropout=best_params['dropout'], recurrent_dropout=0.0)(x)
+        x = BatchNormalization()(x)
+        x = Dropout(best_params['dropout'])(x)
+
+        x = Dense(12, activation='relu', kernel_regularizer=l2(best_params['l2_reg']))(x)
+        x = Dropout(best_params['dropout'])(x)
+        outputs = Dense(1, activation='sigmoid')(x)
+
+        model = Model(inputs=inputs, outputs=outputs)
+        model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=best_params['learning_rate'], clipnorm=1.0), loss='binary_crossentropy', metrics=['accuracy'])
+        early_stop = EarlyStopping(monitor='val_loss', patience=18, restore_best_weights=True, min_delta=1e-4, mode='min')
+        reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=8, min_lr=1e-7, mode='min', verbose=0)
+
+        model.fit(X_aug, y_train, validation_data=(X_val, y_val), epochs=100, batch_size=32, callbacks=[early_stop, reduce_lr], verbose=0)
+
+        train_loss, train_acc = model.evaluate(X_train, y_train, verbose=0)
+        val_loss, val_acc = model.evaluate(X_val, y_val, verbose=0)
+        print(f"[EMD-LSTM] Train Acc: {train_acc:.4f} | Val Acc: {val_acc:.4f} | Gap: {train_acc - val_acc:.4f}")
+
+        return model
+
+
+    @staticmethod
+    def hybrid_lstm_gru(X_train, y_train, X_val, y_val, input_shape):
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+        def objective(trial):
+            units1 = trial.suggest_int('units1', 48, 80, step=16)
+            units2 = trial.suggest_int('units2', 32, 56, step=12)
+            units3 = trial.suggest_int('units3', 16, 40, step=12)
+            dropout = trial.suggest_float('dropout', 0.4, 0.6)
+            l2_reg = trial.suggest_float('l2_reg', 0.02, 0.2, log=True)
+            learning_rate = trial.suggest_float('learning_rate', 0.0001, 0.001, log=True)
+
+            X_aug = TimeSeriesAugmentation.jittering(X_train, sigma=0.015)
+
+            model = Sequential([
+                LSTM(units1, activation='tanh', recurrent_activation='sigmoid', return_sequences=True, input_shape=input_shape, kernel_regularizer=l2(l2_reg), recurrent_regularizer=l2(l2_reg * 0.5), dropout=dropout, recurrent_dropout=0.0),
+                BatchNormalization(),
+                GRU(units2, activation='tanh', recurrent_activation='sigmoid', return_sequences=True, kernel_regularizer=l2(l2_reg), recurrent_regularizer=l2(l2_reg * 0.5), dropout=dropout, recurrent_dropout=0.0),
+                BatchNormalization(),
+                LSTM(units3, activation='tanh', recurrent_activation='sigmoid', kernel_regularizer=l2(l2_reg), recurrent_regularizer=l2(l2_reg * 0.5), dropout=dropout, recurrent_dropout=0.0),
+                BatchNormalization(),
+                Dropout(dropout),
+                Dense(12, activation='relu', kernel_regularizer=l2(l2_reg)),
+                Dropout(dropout),
+                Dense(1, activation='sigmoid')
+            ])
+
+            model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate, clipnorm=1.0), loss='binary_crossentropy', metrics=['accuracy'])
+            early_stop = EarlyStopping(monitor='val_loss', patience=12, restore_best_weights=True, min_delta=1e-4, mode='min')
+            history = model.fit(X_aug, y_train, validation_data=(X_val, y_val), epochs=50, batch_size=32, callbacks=[early_stop], verbose=0)
+
+            _, val_accuracy = model.evaluate(X_val, y_val, verbose=0)
+            return val_accuracy
+
+        study = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler(seed=42, n_startup_trials=5), pruner=optuna.pruners.MedianPruner(n_startup_trials=3, n_warmup_steps=5))
+        study.optimize(objective, n_trials=12, show_progress_bar=False)
+
+        best_params = study.best_params
+        X_aug = TimeSeriesAugmentation.jittering(X_train, sigma=0.015)
+
+        model = Sequential([
+            LSTM(best_params['units1'], activation='tanh', recurrent_activation='sigmoid', return_sequences=True, input_shape=input_shape, kernel_regularizer=l2(best_params['l2_reg']), recurrent_regularizer=l2(best_params['l2_reg'] * 0.5), dropout=best_params['dropout'], recurrent_dropout=0.0),
+            BatchNormalization(),
+            GRU(best_params['units2'], activation='tanh', recurrent_activation='sigmoid', return_sequences=True, kernel_regularizer=l2(best_params['l2_reg']), recurrent_regularizer=l2(best_params['l2_reg'] * 0.5), dropout=best_params['dropout'], recurrent_dropout=0.0),
+            BatchNormalization(),
+            LSTM(best_params['units3'], activation='tanh', recurrent_activation='sigmoid', kernel_regularizer=l2(best_params['l2_reg']), recurrent_regularizer=l2(best_params['l2_reg'] * 0.5), dropout=best_params['dropout'], recurrent_dropout=0.0),
+            BatchNormalization(),
+            Dropout(best_params['dropout']),
+            Dense(12, activation='relu', kernel_regularizer=l2(best_params['l2_reg'])),
+            Dropout(best_params['dropout']),
+            Dense(1, activation='sigmoid')
+        ])
+
+        model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=best_params['learning_rate'], clipnorm=1.0), loss='binary_crossentropy', metrics=['accuracy'])
+        early_stop = EarlyStopping(monitor='val_loss', patience=18, restore_best_weights=True, min_delta=1e-4, mode='min')
+        reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=8, min_lr=1e-7, mode='min', verbose=0)
+
+        model.fit(X_aug, y_train, validation_data=(X_val, y_val), epochs=100, batch_size=32, callbacks=[early_stop, reduce_lr], verbose=0)
+
+        train_loss, train_acc = model.evaluate(X_train, y_train, verbose=0)
+        val_loss, val_acc = model.evaluate(X_val, y_val, verbose=0)
+        print(f"[Hybrid LSTM-GRU] Train Acc: {train_acc:.4f} | Val Acc: {val_acc:.4f} | Gap: {train_acc - val_acc:.4f}")
+
+        return model
+
+
+    @staticmethod
+    def residual_lstm(X_train, y_train, X_val, y_val, input_shape):
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+        def objective(trial):
+            units1 = trial.suggest_int('units1', 48, 80, step=16)
+            units2 = trial.suggest_int('units2', 16, 40, step=12)
+            dropout = trial.suggest_float('dropout', 0.4, 0.6)
+            l2_reg = trial.suggest_float('l2_reg', 0.02, 0.2, log=True)
+            learning_rate = trial.suggest_float('learning_rate', 0.0001, 0.001, log=True)
+
+            X_aug = TimeSeriesAugmentation.jittering(X_train, sigma=0.015)
+
+            inputs = Input(shape=input_shape)
+
+            x = LSTM(units1, activation='tanh', recurrent_activation='sigmoid', return_sequences=True, kernel_regularizer=l2(l2_reg), recurrent_regularizer=l2(l2_reg * 0.5), dropout=dropout, recurrent_dropout=0.0)(inputs)
+            x = BatchNormalization()(x)
+
+            lstm_out = LSTM(units1, activation='tanh', recurrent_activation='sigmoid', return_sequences=True, kernel_regularizer=l2(l2_reg), recurrent_regularizer=l2(l2_reg * 0.5), dropout=dropout, recurrent_dropout=0.0)(x)
+            lstm_out = BatchNormalization()(lstm_out)
+            x = Add()([x, lstm_out])
+            x = Dropout(dropout)(x)
+
+            x = LSTM(units2, activation='tanh', recurrent_activation='sigmoid', kernel_regularizer=l2(l2_reg), recurrent_regularizer=l2(l2_reg * 0.5), dropout=dropout, recurrent_dropout=0.0)(x)
+            x = BatchNormalization()(x)
+            x = Dropout(dropout)(x)
+
+            x = Dense(12, activation='relu', kernel_regularizer=l2(l2_reg))(x)
+            x = Dropout(dropout)(x)
+            outputs = Dense(1, activation='sigmoid')(x)
+
+            model = Model(inputs=inputs, outputs=outputs)
+            model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate, clipnorm=1.0), loss='binary_crossentropy', metrics=['accuracy'])
+            early_stop = EarlyStopping(monitor='val_loss', patience=12, restore_best_weights=True, min_delta=1e-4, mode='min')
+            history = model.fit(X_aug, y_train, validation_data=(X_val, y_val), epochs=50, batch_size=32, callbacks=[early_stop], verbose=0)
+
+            _, val_accuracy = model.evaluate(X_val, y_val, verbose=0)
+            return val_accuracy
+
+        study = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler(seed=42, n_startup_trials=5), pruner=optuna.pruners.MedianPruner(n_startup_trials=3))
+        study.optimize(objective, n_trials=10, show_progress_bar=False)
+
+        best_params = study.best_params
+        X_aug = TimeSeriesAugmentation.jittering(X_train, sigma=0.015)
+
+        inputs = Input(shape=input_shape)
+
+        x = LSTM(best_params['units1'], activation='tanh', recurrent_activation='sigmoid', return_sequences=True, kernel_regularizer=l2(best_params['l2_reg']), recurrent_regularizer=l2(best_params['l2_reg'] * 0.5), dropout=best_params['dropout'], recurrent_dropout=0.0)(inputs)
+        x = BatchNormalization()(x)
+
+        lstm_out = LSTM(best_params['units1'], activation='tanh', recurrent_activation='sigmoid', return_sequences=True, kernel_regularizer=l2(best_params['l2_reg']), recurrent_regularizer=l2(best_params['l2_reg'] * 0.5), dropout=best_params['dropout'], recurrent_dropout=0.0)(x)
+        lstm_out = BatchNormalization()(lstm_out)
+        x = Add()([x, lstm_out])
+        x = Dropout(best_params['dropout'])(x)
+
+        x = LSTM(best_params['units2'], activation='tanh', recurrent_activation='sigmoid', kernel_regularizer=l2(best_params['l2_reg']), recurrent_regularizer=l2(best_params['l2_reg'] * 0.5), dropout=best_params['dropout'], recurrent_dropout=0.0)(x)
+        x = BatchNormalization()(x)
+        x = Dropout(best_params['dropout'])(x)
+
+        x = Dense(12, activation='relu', kernel_regularizer=l2(best_params['l2_reg']))(x)
+        x = Dropout(best_params['dropout'])(x)
+        outputs = Dense(1, activation='sigmoid')(x)
+
+        model = Model(inputs=inputs, outputs=outputs)
+        model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=best_params['learning_rate'], clipnorm=1.0), loss='binary_crossentropy', metrics=['accuracy'])
+        early_stop = EarlyStopping(monitor='val_loss', patience=18, restore_best_weights=True, min_delta=1e-4, mode='min')
+        reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=8, min_lr=1e-7, mode='min', verbose=0)
+
+        model.fit(X_aug, y_train, validation_data=(X_val, y_val), epochs=100, batch_size=32, callbacks=[early_stop, reduce_lr], verbose=0)
+
+        train_loss, train_acc = model.evaluate(X_train, y_train, verbose=0)
+        val_loss, val_acc = model.evaluate(X_val, y_val, verbose=0)
+        print(f"[Residual LSTM] Train Acc: {train_acc:.4f} | Val Acc: {val_acc:.4f} | Gap: {train_acc - val_acc:.4f}")
+        print(f"[Residual LSTM] Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
+
+        return model
+
+
+    @staticmethod
+    def tcn(X_train, y_train, X_val, y_val, input_shape):
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+        def objective(trial):
+            n_filters = trial.suggest_int('n_filters', 16, 48, step=16)
+            kernel_size = trial.suggest_int('kernel_size', 3, 5)
+            n_stacks = trial.suggest_int('n_stacks', 1, 2)
+            dropout = trial.suggest_float('dropout', 0.3, 0.5)
+            l2_reg = trial.suggest_float('l2_reg', 0.01, 0.1, log=True)
+            learning_rate = trial.suggest_float('learning_rate', 0.0001, 0.002, log=True)
+
+            X_aug = TimeSeriesAugmentation.jittering(X_train, sigma=0.015)
+
+            inputs = Input(shape=input_shape)
+            x = inputs
+
+            for stack in range(n_stacks):
+                dilation_rates = [2**i for i in range(4)]
+
+                for dilation_rate in dilation_rates:
+                    residual = x
+
+                    conv1 = Conv1D(filters=n_filters, kernel_size=kernel_size, dilation_rate=dilation_rate, padding='causal', activation='relu', kernel_regularizer=l2(l2_reg))(x)
+                    conv1 = BatchNormalization()(conv1)
+                    conv1 = Dropout(dropout)(conv1)
+
+                    conv2 = Conv1D(filters=n_filters, kernel_size=kernel_size, dilation_rate=dilation_rate, padding='causal', activation='relu', kernel_regularizer=l2(l2_reg))(conv1)
+                    conv2 = BatchNormalization()(conv2)
+                    conv2 = Dropout(dropout)(conv2)
+
+                    if residual.shape[-1] != n_filters:
+                        residual = Conv1D(n_filters, 1, padding='same')(residual)
+
+                    x = Add()([residual, conv2])
+
+            x = GlobalAveragePooling1D()(x)
+            x = Dense(24, activation='relu', kernel_regularizer=l2(l2_reg))(x)
+            x = BatchNormalization()(x)
+            x = Dropout(dropout)(x)
+            outputs = Dense(1, activation='sigmoid')(x)
+
+            model = Model(inputs=inputs, outputs=outputs)
+            model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate, clipnorm=1.0), loss='binary_crossentropy', metrics=['accuracy'])
+            early_stop = EarlyStopping(monitor='val_loss', patience=12, restore_best_weights=True, min_delta=1e-4, mode='min')
+            history = model.fit(X_aug, y_train, validation_data=(X_val, y_val), epochs=50, batch_size=32, callbacks=[early_stop], verbose=0)
+
+            _, val_accuracy = model.evaluate(X_val, y_val, verbose=0)
+            return val_accuracy
+
+        study = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler(seed=42, n_startup_trials=5), pruner=optuna.pruners.MedianPruner(n_startup_trials=3, n_warmup_steps=5))
+        study.optimize(objective, n_trials=10, show_progress_bar=False)
+
+        best_params = study.best_params
+        X_aug = TimeSeriesAugmentation.jittering(X_train, sigma=0.015)
+
+        inputs = Input(shape=input_shape)
+        x = inputs
+
+        for stack in range(best_params['n_stacks']):
+            dilation_rates = [2**i for i in range(4)]
+
+            for dilation_rate in dilation_rates:
+                residual = x
+
+                conv1 = Conv1D(filters=best_params['n_filters'], kernel_size=best_params['kernel_size'], dilation_rate=dilation_rate, padding='causal', activation='relu', kernel_regularizer=l2(best_params['l2_reg']))(x)
+                conv1 = BatchNormalization()(conv1)
+                conv1 = Dropout(best_params['dropout'])(conv1)
+
+                conv2 = Conv1D(filters=best_params['n_filters'], kernel_size=best_params['kernel_size'], dilation_rate=dilation_rate, padding='causal', activation='relu', kernel_regularizer=l2(best_params['l2_reg']))(conv1)
+                conv2 = BatchNormalization()(conv2)
+                conv2 = Dropout(best_params['dropout'])(conv2)
+
+                if residual.shape[-1] != best_params['n_filters']:
+                    residual = Conv1D(best_params['n_filters'], 1, padding='same')(residual)
+
+                x = Add()([residual, conv2])
+
+        x = GlobalAveragePooling1D()(x)
+        x = Dense(24, activation='relu', kernel_regularizer=l2(best_params['l2_reg']))(x)
+        x = BatchNormalization()(x)
+        x = Dropout(best_params['dropout'])(x)
+        outputs = Dense(1, activation='sigmoid')(x)
+
+        model = Model(inputs=inputs, outputs=outputs)
+        model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=best_params['learning_rate'], clipnorm=1.0), loss='binary_crossentropy', metrics=['accuracy'])
+        early_stop = EarlyStopping(monitor='val_loss', patience=18, restore_best_weights=True, min_delta=1e-4, mode='min')
+        reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=8, min_lr=1e-7, mode='min', verbose=0)
+
+        model.fit(X_aug, y_train, validation_data=(X_val, y_val), epochs=100, batch_size=32, callbacks=[early_stop, reduce_lr], verbose=0)
+
+        train_loss, train_acc = model.evaluate(X_train, y_train, verbose=0)
+        val_loss, val_acc = model.evaluate(X_val, y_val, verbose=0)
+        print(f"[TCN] Train Acc: {train_acc:.4f} | Val Acc: {val_acc:.4f} | Gap: {train_acc - val_acc:.4f}")
+
+        return model
+
+
+    @staticmethod
+    def cnn_lstm(X_train, y_train, X_val, y_val, input_shape):
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+        def objective(trial):
+            cnn_filters = trial.suggest_int('cnn_filters', 16, 48, step=16)
+            cnn_kernel = trial.suggest_int('cnn_kernel', 3, 5)
+            lstm_units1 = trial.suggest_int('lstm_units1', 32, 64, step=16)
+            lstm_units2 = trial.suggest_int('lstm_units2', 16, 40, step=12)
+            dropout = trial.suggest_float('dropout', 0.4, 0.6)
+            l2_reg = trial.suggest_float('l2_reg', 0.02, 0.15, log=True)
+            learning_rate = trial.suggest_float('learning_rate', 0.0001, 0.001, log=True)
+
+            X_aug = TimeSeriesAugmentation.jittering(X_train, sigma=0.015)
+
+            model = Sequential([
+                Conv1D(filters=cnn_filters, kernel_size=cnn_kernel, activation='relu', padding='same', input_shape=input_shape, kernel_regularizer=l2(l2_reg)),
+                BatchNormalization(),
+                Dropout(dropout),
+                Conv1D(filters=cnn_filters, kernel_size=cnn_kernel, activation='relu', padding='same', kernel_regularizer=l2(l2_reg)),
+                BatchNormalization(),
+                MaxPooling1D(pool_size=2),
+                Dropout(dropout),
+                LSTM(lstm_units1, activation='tanh', recurrent_activation='sigmoid', return_sequences=True, kernel_regularizer=l2(l2_reg), recurrent_regularizer=l2(l2_reg * 0.5), dropout=dropout, recurrent_dropout=0.0),
+                BatchNormalization(),
+                LSTM(lstm_units2, activation='tanh', recurrent_activation='sigmoid', kernel_regularizer=l2(l2_reg), recurrent_regularizer=l2(l2_reg * 0.5), dropout=dropout, recurrent_dropout=0.0),
+                BatchNormalization(),
+                Dropout(dropout),
+                Dense(16, activation='relu', kernel_regularizer=l2(l2_reg)),
+                Dropout(dropout),
+                Dense(1, activation='sigmoid')
+            ])
+
+            model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate, clipnorm=1.0), loss='binary_crossentropy', metrics=['accuracy'])
+            early_stop = EarlyStopping(monitor='val_loss', patience=12, restore_best_weights=True, min_delta=1e-4, mode='min')
+            history = model.fit(X_aug, y_train, validation_data=(X_val, y_val), epochs=50, batch_size=32, callbacks=[early_stop], verbose=0)
+
+            _, val_accuracy = model.evaluate(X_val, y_val, verbose=0)
+            return val_accuracy
+
+        study = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler(seed=42, n_startup_trials=5), pruner=optuna.pruners.MedianPruner(n_startup_trials=3, n_warmup_steps=5))
+        study.optimize(objective, n_trials=12, show_progress_bar=False)
+
+        best_params = study.best_params
+        X_aug = TimeSeriesAugmentation.jittering(X_train, sigma=0.015)
+
+        model = Sequential([
+            Conv1D(filters=best_params['cnn_filters'], kernel_size=best_params['cnn_kernel'], activation='relu', padding='same', input_shape=input_shape, kernel_regularizer=l2(best_params['l2_reg'])),
+            BatchNormalization(),
+            Dropout(best_params['dropout']),
+            Conv1D(filters=best_params['cnn_filters'], kernel_size=best_params['cnn_kernel'], activation='relu', padding='same', kernel_regularizer=l2(best_params['l2_reg'])),
+            BatchNormalization(),
+            MaxPooling1D(pool_size=2),
+            Dropout(best_params['dropout']),
+            LSTM(best_params['lstm_units1'], activation='tanh', recurrent_activation='sigmoid', return_sequences=True, kernel_regularizer=l2(best_params['l2_reg']), recurrent_regularizer=l2(best_params['l2_reg'] * 0.5), dropout=best_params['dropout'], recurrent_dropout=0.0),
+            BatchNormalization(),
+            LSTM(best_params['lstm_units2'], activation='tanh', recurrent_activation='sigmoid', kernel_regularizer=l2(best_params['l2_reg']), recurrent_regularizer=l2(best_params['l2_reg'] * 0.5), dropout=best_params['dropout'], recurrent_dropout=0.0),
+            BatchNormalization(),
+            Dropout(best_params['dropout']),
+            Dense(16, activation='relu', kernel_regularizer=l2(best_params['l2_reg'])),
+            Dropout(best_params['dropout']),
+            Dense(1, activation='sigmoid')
+        ])
+
+        model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=best_params['learning_rate'], clipnorm=1.0), loss='binary_crossentropy', metrics=['accuracy'])
+        early_stop = EarlyStopping(monitor='val_loss', patience=18, restore_best_weights=True, min_delta=1e-4, mode='min')
+        reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=8, min_lr=1e-7, mode='min', verbose=0)
+
+        model.fit(X_aug, y_train, validation_data=(X_val, y_val), epochs=100, batch_size=32, callbacks=[early_stop, reduce_lr], verbose=0)
+
+        train_loss, train_acc = model.evaluate(X_train, y_train, verbose=0)
+        val_loss, val_acc = model.evaluate(X_val, y_val, verbose=0)
+        print(f"[CNN-LSTM] Train Acc: {train_acc:.4f} | Val Acc: {val_acc:.4f} | Gap: {train_acc - val_acc:.4f}")
+
+        return model
+
+
+    @staticmethod
+    def lstm_attention(X_train, y_train, X_val, y_val, input_shape):
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+        def objective(trial):
+            lstm_units1 = trial.suggest_int('lstm_units1', 48, 80, step=16)
+            lstm_units2 = trial.suggest_int('lstm_units2', 32, 56, step=12)
+            dropout = trial.suggest_float('dropout', 0.4, 0.6)
+            l2_reg = trial.suggest_float('l2_reg', 0.02, 0.15, log=True)
+            learning_rate = trial.suggest_float('learning_rate', 0.0001, 0.001, log=True)
+
+            X_aug = TimeSeriesAugmentation.jittering(X_train, sigma=0.015)
+
+            inputs = Input(shape=input_shape)
+
+            lstm_out = LSTM(lstm_units1, activation='tanh', recurrent_activation='sigmoid', return_sequences=True, kernel_regularizer=l2(l2_reg), recurrent_regularizer=l2(l2_reg * 0.5), dropout=dropout, recurrent_dropout=0.0)(inputs)
+            lstm_out = BatchNormalization()(lstm_out)
+
+            attention = Dense(1, activation='tanh', kernel_regularizer=l2(l2_reg))(lstm_out)
+            attention = Flatten()(attention)
+            attention = Activation('softmax')(attention)
+            attention = RepeatVector(lstm_units1)(attention)
+            attention = Permute([2, 1])(attention)
+
+            attended = Multiply()([lstm_out, attention])
+            attended = Lambda(lambda x: tf.reduce_sum(x, axis=1))(attended)
+            attended = BatchNormalization()(attended)
+            attended = Dropout(dropout)(attended)
+
+            x = Dense(lstm_units2, activation='relu', kernel_regularizer=l2(l2_reg))(attended)
+            x = BatchNormalization()(x)
+            x = Dropout(dropout)(x)
+
+            x = Dense(16, activation='relu', kernel_regularizer=l2(l2_reg))(x)
+            x = Dropout(dropout)(x)
+            outputs = Dense(1, activation='sigmoid')(x)
+
+            model = Model(inputs=inputs, outputs=outputs)
+            model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate, clipnorm=1.0), loss='binary_crossentropy', metrics=['accuracy'])
+            early_stop = EarlyStopping(monitor='val_loss', patience=12, restore_best_weights=True, min_delta=1e-4, mode='min')
+            history = model.fit(X_aug, y_train, validation_data=(X_val, y_val), epochs=50, batch_size=32, callbacks=[early_stop], verbose=0)
+
+            _, val_accuracy = model.evaluate(X_val, y_val, verbose=0)
+            return val_accuracy
+
+        study = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler(seed=42, n_startup_trials=5), pruner=optuna.pruners.MedianPruner(n_startup_trials=3, n_warmup_steps=5))
+        study.optimize(objective, n_trials=12, show_progress_bar=False)
+
+        best_params = study.best_params
+        X_aug = TimeSeriesAugmentation.jittering(X_train, sigma=0.015)
+
+        inputs = Input(shape=input_shape)
+
+        lstm_out = LSTM(best_params['lstm_units1'], activation='tanh', recurrent_activation='sigmoid', return_sequences=True, kernel_regularizer=l2(best_params['l2_reg']), recurrent_regularizer=l2(best_params['l2_reg'] * 0.5), dropout=best_params['dropout'], recurrent_dropout=0.0)(inputs)
+        lstm_out = BatchNormalization()(lstm_out)
+
+        attention = Dense(1, activation='tanh', kernel_regularizer=l2(best_params['l2_reg']))(lstm_out)
+        attention = Flatten()(attention)
+        attention = Activation('softmax')(attention)
+        attention = RepeatVector(best_params['lstm_units1'])(attention)
+        attention = Permute([2, 1])(attention)
+
+        attended = Multiply()([lstm_out, attention])
+        attended = Lambda(lambda x: tf.reduce_sum(x, axis=1))(attended)
+        attended = BatchNormalization()(attended)
+        attended = Dropout(best_params['dropout'])(attended)
+
+        x = Dense(best_params['lstm_units2'], activation='relu', kernel_regularizer=l2(best_params['l2_reg']))(attended)
+        x = BatchNormalization()(x)
+        x = Dropout(best_params['dropout'])(x)
+
+        x = Dense(16, activation='relu', kernel_regularizer=l2(best_params['l2_reg']))(x)
+        x = Dropout(best_params['dropout'])(x)
+        outputs = Dense(1, activation='sigmoid')(x)
+
+        model = Model(inputs=inputs, outputs=outputs)
+        model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=best_params['learning_rate'], clipnorm=1.0), loss='binary_crossentropy', metrics=['accuracy'])
+        early_stop = EarlyStopping(monitor='val_loss', patience=18, restore_best_weights=True, min_delta=1e-4, mode='min')
+        reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=8, min_lr=1e-7, mode='min', verbose=0)
+
+        model.fit(X_aug, y_train, validation_data=(X_val, y_val), epochs=100, batch_size=32, callbacks=[early_stop, reduce_lr], verbose=0)
+
+        train_loss, train_acc = model.evaluate(X_train, y_train, verbose=0)
+        val_loss, val_acc = model.evaluate(X_val, y_val, verbose=0)
+        print(f"[LSTM-Attention] Train Acc: {train_acc:.4f} | Val Acc: {val_acc:.4f} | Gap: {train_acc - val_acc:.4f}")
+
+        return model
